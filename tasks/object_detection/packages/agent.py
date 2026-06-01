@@ -187,13 +187,24 @@ class ObjectDetectionAgent:
     def _try_cv2dnn(self):
         try:
             print("[ObjectDetection] Loading ONNX model via cv2.dnn...")
-            self.net          = cv2.dnn.readNetFromONNX(self.model_path)
+            self.net = cv2.dnn.readNetFromONNX(self.model_path)
+            # YOLOv5 ONNX exports usually fail at inference in OpenCV DNN (esp. on Windows).
+            dummy = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            blob = cv2.dnn.blobFromImage(
+                dummy, 1 / 255.0, (self.img_size, self.img_size), swapRB=False
+            )
+            self.net.setInput(blob)
+            self.net.forward()
             self._backend     = 'cv2dnn'
             self.model_loaded = True
             print(f"[ObjectDetection] Model ready (cv2.dnn, img_size={self.img_size}).")
         except Exception as e:
-            self.load_error = f"Failed to load ONNX model: {e}"
-            print(f"[ObjectDetection] {self.load_error}")
+            self.model_loaded = False
+            self.load_error = (
+                "Cannot run YOLO ONNX with OpenCV DNN. "
+                "Install onnxruntime in your venv: pip install onnxruntime"
+            )
+            print(f"[ObjectDetection] {self.load_error} ({e})")
 
     def _frame_skip(self) -> int:
         try:

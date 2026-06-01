@@ -6,9 +6,23 @@ class_names = {0: 'duckie', 1: 'truck', 2: 'sign'}
 
 
 def should_stop(detections: List[Detection], img_size: int) -> Tuple[bool, str]:
-    """Return (True, reason) to stop the bot, (False, '') to keep moving."""
-    stop_y = img_size * 0.55
-    for (x1, y1, x2, y2), score, cls_id in detections:
-        if y2 > stop_y:
-            return True, class_names.get(cls_id, str(cls_id)) + ' detected close ahead'
+    """
+    Stop when a filtered duckie is close ahead.
+    y2 (bottom of box) large -> object is low in the image -> near the robot.
+    """
+    if not detections:
+        return False, ''
+
+    # img_size = camera frame height in pixels (e.g. 480).
+    close_y_threshold = img_size * 0.55
+
+    for bbox, score, _cls_id in detections:
+        xmin, ymin, xmax, ymax = bbox
+        width = xmax - xmin
+        height = ymax - ymin
+        area = width * height
+
+        if ymax >= close_y_threshold and area > 500:
+            return True, f'duckie ahead (score={score:.2f})'
+
     return False, ''
