@@ -56,6 +56,7 @@ htmlcov/
 
 # Dataset
 tasks/object_detection/dataset/*
+tasks/object_detection/object_detection_dataset.zip
 
 # Model artifacts
 tasks/object_detection/models/*
