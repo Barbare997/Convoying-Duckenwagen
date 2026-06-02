@@ -52,6 +52,11 @@ def shutdown():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/convoy/status')
+def convoy_status():
+    return jsonify(agent.get_leader_status())
+
+
 def main():
     global camera, wheels, leds, stop_event
 

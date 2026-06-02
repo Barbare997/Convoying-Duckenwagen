@@ -11,3 +11,10 @@ follower_min_speed: 0.0
 distance_target: 0.0
 distance_kp: 0.6
 leader_timeout_s: 0.4
+
+status_publish_hz: 10
+status_poll_hz: 10
+request_timeout_s: 0.2
+stop_hold_s: 2.0
+decel_time_s: 0.8
+decel_steps: 8
