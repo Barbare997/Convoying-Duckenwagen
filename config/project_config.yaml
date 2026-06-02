@@ -1,0 +1,13 @@
+role: leader
+leader_host: kvati.local
+leader_port: 5055
+
+cruise_speed: 0.20
+slow_speed: 0.12
+loop_hz: 20
+
+follower_max_speed: 0.20
+follower_min_speed: 0.0
+distance_target: 0.0
+distance_kp: 0.6
+leader_timeout_s: 0.4
