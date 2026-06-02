@@ -18,3 +18,13 @@ request_timeout_s: 0.2
 stop_hold_s: 2.0
 decel_time_s: 0.8
 decel_steps: 8
+
+# AprilTag event mapping (fill real IDs from your sign set)
+stop_tag_ids: [20,21,22,23,24,25,26,27,28,29]
+slow_tag_ids: [39]
+leader_tag_ids: []
+
+# Detection stability controls
+sign_confirm_frames: 3
+sign_cooldown_s: 2.0
+sign_center_roi: 1.0

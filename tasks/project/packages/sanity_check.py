@@ -39,6 +39,23 @@ def _run_and_stop(loop_fn, timeout_s: float = 0.2):
     assert wheels.commands[-1] == (0.0, 0.0), f"{loop_fn.__name__} final command was not stop"
 
 
+def test_next_state_transitions():
+    assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_SLOW_SIGN) == agent.STATE_SLOW
+    assert agent.next_state(agent.STATE_SLOW, agent.EVENT_NORMAL) == agent.STATE_CRUISING
+    assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_STOP_SIGN) == agent.STATE_STOPPING
+    assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_TIMEOUT) == agent.STATE_STOPPING
+    print("OK: FSM transitions")
+
+
+def test_smooth_stop():
+    wheels = DummyWheels()
+    stop_event = threading.Event()
+    agent.smooth_stop(wheels, current_speed=0.4, decel_time_s=0.05, decel_steps=4, stop_event=stop_event)
+    assert wheels.commands, "smooth_stop produced no wheel commands"
+    assert wheels.commands[-1] == (0.0, 0.0), "smooth_stop did not end at full stop"
+    print("OK: smooth_stop reaches zero")
+
+
 def test_config_loads():
     cfg = agent.load_config()
     assert isinstance(cfg, dict), "Config must be a dictionary"
@@ -86,6 +103,8 @@ def test_loops_exit_cleanly():
 
 
 if __name__ == "__main__":
+    test_next_state_transitions()
+    test_smooth_stop()
     test_config_loads()
     test_role_dispatch()
     test_loops_exit_cleanly()
