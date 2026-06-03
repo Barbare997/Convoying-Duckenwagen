@@ -351,6 +351,17 @@ def package_task(task_name):
         if os.path.exists(task_server_dir):
             print(f"   Adding server: servers/{task_name}/")
             tar.add(task_server_dir, arcname=f'servers/{task_name}', filter=no_pycache)
+        if task_name == 'project':
+            for dep in (
+                ('object_detection', 'packages'),
+                ('object_detection', 'models'),
+                ('visual_lane_servoing', 'packages'),
+            ):
+                dep_path = os.path.join(PROJECT_ROOT, 'tasks', dep[0], dep[1])
+                if os.path.exists(dep_path):
+                    arc = f'tasks/{dep[0]}/{dep[1]}'
+                    print(f"   Adding dependency: {arc}/")
+                    tar.add(dep_path, arcname=arc, filter=no_pycache)
 
     buf.seek(0)
     print("Package created!")

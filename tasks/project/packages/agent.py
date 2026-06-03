@@ -50,8 +50,13 @@ _sign_runtime = {
     "active_until": 0.0,
 }
 _lane_agent: Optional[LaneServoingAgent] = None
- 
- 
+_detection_agent = None
+_detection_init_attempted = False
+
+# YOLO class id for leader Duckiebot (trained as "truck" in object_detection task).
+LEADER_YOLO_CLASS_ID = 1
+
+
 def load_config() -> Dict[str, Any]:
     # Load only the fields needed by the skeleton. Missing file -> safe defaults.
     try:
@@ -84,6 +89,11 @@ def load_config() -> Dict[str, Any]:
         "sign_cooldown_s": float(cfg.get("sign_cooldown_s", 2.0)),
         "sign_center_roi": float(cfg.get("sign_center_roi", 1.0)),
         "leader_tag_ids": [int(x) for x in cfg.get("leader_tag_ids", [])],
+        "leader_class_id": int(cfg.get("leader_class_id", LEADER_YOLO_CLASS_ID)),
+        "leader_yolo_enabled": bool(cfg.get("leader_yolo_enabled", True)),
+        "leader_center_roi": float(cfg.get("leader_center_roi", 0.65)),
+        "leader_min_bbox_area": int(cfg.get("leader_min_bbox_area", 400)),
+        "leader_min_y2_frac": float(cfg.get("leader_min_y2_frac", 0.25)),
     }
  
  
@@ -334,6 +344,129 @@ def estimate_leader_distance_signal(
     return best_ratio, best_id
 
 
+def _get_detection_agent():
+    """Lazy-load YOLO agent for follower leader spacing (optional onnxruntime)."""
+    global _detection_agent, _detection_init_attempted
+    if _detection_init_attempted:
+        return _detection_agent
+
+    _detection_init_attempted = True
+    try:
+        from tasks.object_detection.packages.agent import ObjectDetectionAgent
+
+        _detection_agent = ObjectDetectionAgent()
+        if _detection_agent.model_loaded:
+            print(
+                f"[Project][YOLO] Leader spacing model ready "
+                f"(img_size={_detection_agent.img_size})."
+            )
+        else:
+            print(
+                f"[Project][YOLO] Leader spacing unavailable: "
+                f"{_detection_agent.load_error}"
+            )
+            _detection_agent = None
+    except Exception as e:
+        _detection_agent = None
+        print(f"[Project][YOLO] Leader spacing unavailable ({e}).")
+    return _detection_agent
+
+
+def _leader_truck_in_roi(
+    bbox: Tuple[int, int, int, int],
+    frame_shape: Tuple[int, int],
+    cfg: Dict[str, Any],
+) -> bool:
+    h, w = frame_shape
+    x1, y1, x2, y2 = bbox
+    area = (x2 - x1) * (y2 - y1)
+    if area < int(cfg.get("leader_min_bbox_area", 400)):
+        return False
+    if y2 / max(1.0, float(h)) < float(cfg.get("leader_min_y2_frac", 0.25)):
+        return False
+
+    roi = max(0.2, min(1.0, float(cfg.get("leader_center_roi", 0.65))))
+    margin = (1.0 - roi) * 0.5
+    cx = 0.5 * (x1 + x2)
+    return margin * w <= cx <= (1.0 - margin) * w
+
+
+def _leader_truck_distance_signal(
+    bbox: Tuple[int, int, int, int],
+    frame_shape: Tuple[int, int],
+) -> float:
+    """Monocular proximity: larger + lower in frame => closer (same scale idea as AprilTag ratio)."""
+    h, w = frame_shape
+    x1, y1, x2, y2 = bbox
+    area_norm = ((x2 - x1) * (y2 - y1)) / max(1.0, float(w * h))
+    y2_frac = y2 / max(1.0, float(h))
+    return 0.65 * area_norm + 0.35 * y2_frac
+
+
+def estimate_leader_distance_from_yolo(
+    frame_bgr,
+    cfg: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Pick the best in-lane truck box as the leader; return (distance_signal, confidence).
+    Used when leader_tag_ids is empty (no AprilTag on leader back).
+    """
+    if frame_bgr is None:
+        return None, None
+
+    det_agent = _get_detection_agent()
+    if det_agent is None or not det_agent.model_loaded:
+        return None, None
+
+    leader_cls = int(cfg.get("leader_class_id", LEADER_YOLO_CLASS_ID))
+    frame_shape = frame_bgr.shape[:2]
+    try:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        detections = det_agent.detect(frame_rgb)
+    except Exception as e:
+        print(f"[Project][YOLO] detect failed: {e}")
+        return None, None
+
+    if not detections:
+        return None, None
+
+    best_signal = None
+    best_score = None
+    for bbox, conf, cls_id in detections:
+        if int(cls_id) != leader_cls:
+            continue
+        if not _leader_truck_in_roi(bbox, frame_shape, cfg):
+            continue
+        signal = _leader_truck_distance_signal(bbox, frame_shape)
+        if best_signal is None or signal > best_signal:
+            best_signal = signal
+            best_score = float(conf)
+
+    return best_signal, best_score
+
+
+def estimate_follower_distance_signal(
+    frame_bgr,
+    frame_gray,
+    frame_shape: Optional[Tuple[int, int]],
+    cfg: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[Any]]:
+    """
+    AprilTag on leader if configured; otherwise YOLO truck box (hybrid convoy spacing).
+    """
+    leader_tag_ids = set(int(x) for x in cfg.get("leader_tag_ids", []))
+    if leader_tag_ids:
+        detections = _detect_apriltags(frame_gray)
+        signal, tag_id = estimate_leader_distance_signal(detections, frame_shape, cfg)
+        return signal, tag_id
+
+    if not cfg.get("leader_yolo_enabled", True):
+        return None, None
+
+    signal, conf = estimate_leader_distance_from_yolo(frame_bgr, cfg)
+    return signal, conf
+
+
 def _get_lane_agent() -> LaneServoingAgent:
     global _lane_agent
     if _lane_agent is None:
@@ -467,19 +600,28 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     target_speed = 0.0
     commanded_speed = 0.0
     prev_mode = None
-    last_leader_tag_id = None
+    last_distance_meta = None
     leader_tag_ids = set(int(x) for x in cfg.get("leader_tag_ids", []))
+    use_yolo_spacing = not leader_tag_ids and bool(cfg.get("leader_yolo_enabled", True))
+    if use_yolo_spacing:
+        print("[Project][Follower] Leader spacing: HTTP + YOLO truck (no leader AprilTag).")
+    elif leader_tag_ids:
+        print(f"[Project][Follower] Leader spacing: HTTP + AprilTag ids={sorted(leader_tag_ids)}.")
+    else:
+        print("[Project][Follower] Leader spacing: HTTP only.")
+
     while not stop_event.is_set():
         now = time.time()
+        frame_bgr, frame_gray = _extract_frame_gray(camera)
+        frame_shape = None if frame_bgr is None else frame_bgr.shape[:2]
+
         distance_signal = None
-        leader_tag_id = None
-        if leader_tag_ids:
-            frame_bgr, frame_gray = _extract_frame_gray(camera)
-            frame_shape = None if frame_bgr is None else frame_bgr.shape[:2]
-            detections = _detect_apriltags(frame_gray)
-            distance_signal, leader_tag_id = estimate_leader_distance_signal(detections, frame_shape, cfg)
-            if leader_tag_id is not None:
-                last_leader_tag_id = leader_tag_id
+        distance_meta = None
+        distance_signal, distance_meta = estimate_follower_distance_signal(
+            frame_bgr, frame_gray, frame_shape, cfg
+        )
+        if distance_meta is not None:
+            last_distance_meta = distance_meta
 
         if now - last_poll >= poll_dt:
             try:
@@ -497,17 +639,18 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
  
         is_stale = (now - float(latest.get("ts", 0.0))) > leader_timeout_s
         state = str(latest.get("state", "STOPPED")).upper()
+        leader_speed = max(0.0, float(latest.get("speed", 0.0)))
         if is_stale:
             mode, target_speed = EVENT_TIMEOUT, 0.0
         elif state == STATE_STOPPED:
             mode, target_speed = STATE_STOPPED, 0.0
         elif state == STATE_SLOW:
-            mode, target_speed = STATE_SLOW, min(slow_speed, follower_max_speed)
+            mode, target_speed = STATE_SLOW, min(slow_speed, leader_speed, follower_max_speed)
         else:
-            mode, target_speed = STATE_CRUISING, min(cruise_speed, follower_max_speed)
- 
+            mode, target_speed = STATE_CRUISING, min(cruise_speed, leader_speed, follower_max_speed)
+
         if mode in (STATE_CRUISING, STATE_SLOW) and distance_signal is not None:
-            # Smaller observed tag -> farther away -> increase speed.
+            # Smaller signal -> leader farther -> speed up; larger -> closer -> slow down.
             distance_error = distance_target - float(distance_signal)
             target_speed += distance_kp * distance_error
             target_speed = max(follower_min_speed, min(follower_max_speed, target_speed))
@@ -538,8 +681,8 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             age = now - float(latest.get("ts", 0.0))
             print(
                 f"[Project][Follower] mode={mode} target_speed={target_speed:.2f} cmd={commanded_speed:.2f} "
-                f"leader_state={state} age={age:.2f}s "
-                f"dist_signal={distance_signal} leader_tag_id={last_leader_tag_id}"
+                f"leader_state={state} leader_speed={leader_speed:.2f} age={age:.2f}s "
+                f"dist_signal={distance_signal} dist_meta={last_distance_meta}"
             )
             last_log = now
         time.sleep(dt)

@@ -61,7 +61,38 @@ def test_config_loads():
     assert isinstance(cfg, dict), "Config must be a dictionary"
     assert "role" in cfg, "Config missing role"
     assert "loop_hz" in cfg, "Config missing loop_hz"
+    assert "leader_yolo_enabled" in cfg, "Config missing leader_yolo_enabled"
     print("OK: config loads")
+
+
+def test_yolo_leader_distance_signal():
+    cfg = {
+        "leader_class_id": 1,
+        "leader_center_roi": 1.0,
+        "leader_min_bbox_area": 100,
+        "leader_min_y2_frac": 0.1,
+    }
+    import numpy as np
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    # Farther truck: smaller, higher in image
+    far = ((200, 80, 280, 200), 0.9, 1)
+    # Closer truck: larger, lower in image
+    near = ((220, 200, 420, 420), 0.9, 1)
+
+    class FakeDet:
+        model_loaded = True
+
+        def detect(self, _rgb):
+            return [far, near]
+
+    agent._detection_agent = FakeDet()
+    agent._detection_init_attempted = True
+    signal, conf = agent.estimate_leader_distance_from_yolo(frame, cfg)
+    assert signal is not None and conf == 0.9
+    near_signal = agent._leader_truck_distance_signal(near[0], frame.shape[:2])
+    assert abs(signal - near_signal) < 1e-6
+    print("OK: YOLO leader distance picks nearest truck")
 
 
 def test_role_dispatch():
@@ -106,6 +137,7 @@ if __name__ == "__main__":
     test_next_state_transitions()
     test_smooth_stop()
     test_config_loads()
+    test_yolo_leader_distance_signal()
     test_role_dispatch()
     test_loops_exit_cleanly()
     print("All sanity checks passed.")
