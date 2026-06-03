@@ -88,7 +88,6 @@ def load_config() -> Dict[str, Any]:
         "sign_confirm_frames": int(cfg.get("sign_confirm_frames", 3)),
         "sign_cooldown_s": float(cfg.get("sign_cooldown_s", 2.0)),
         "sign_center_roi": float(cfg.get("sign_center_roi", 1.0)),
-        "leader_tag_ids": [int(x) for x in cfg.get("leader_tag_ids", [])],
         "leader_class_id": int(cfg.get("leader_class_id", LEADER_YOLO_CLASS_ID)),
         "leader_yolo_enabled": bool(cfg.get("leader_yolo_enabled", True)),
         "leader_center_roi": float(cfg.get("leader_center_roi", 0.65)),
@@ -299,51 +298,6 @@ def detect_sign_event(
     return EVENT_NORMAL
 
 
-def _estimate_tag_size_ratio(det: Any, frame_shape: Optional[Tuple[int, int]]) -> Optional[float]:
-    if frame_shape is None:
-        return None
-    h, w = frame_shape
-    try:
-        corners = det.corners
-        if corners is None or len(corners) != 4:
-            return None
-        p0, p1, p2, p3 = corners
-        e1 = ((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2) ** 0.5
-        e2 = ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
-        side = 0.5 * (e1 + e2)
-        return float(side / max(1.0, min(w, h)))
-    except Exception:
-        return None
-
-
-def estimate_leader_distance_signal(
-    detections: List[Any],
-    frame_shape: Optional[Tuple[int, int]],
-    cfg: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[int]]:
-    leader_ids = set(int(x) for x in cfg.get("leader_tag_ids", []))
-    if not detections or not leader_ids:
-        return None, None
-
-    best_ratio = None
-    best_id = None
-    for det in detections:
-        try:
-            tag_id = int(det.tag_id)
-        except Exception:
-            continue
-        if tag_id not in leader_ids:
-            continue
-        ratio = _estimate_tag_size_ratio(det, frame_shape)
-        if ratio is None:
-            continue
-        # Larger tag in image => closer; pick largest for strongest signal.
-        if best_ratio is None or ratio > best_ratio:
-            best_ratio = ratio
-            best_id = tag_id
-    return best_ratio, best_id
-
-
 def _get_detection_agent():
     """Lazy-load YOLO agent for follower leader spacing (optional onnxruntime)."""
     global _detection_agent, _detection_init_attempted
@@ -395,7 +349,7 @@ def _leader_truck_distance_signal(
     bbox: Tuple[int, int, int, int],
     frame_shape: Tuple[int, int],
 ) -> float:
-    """Monocular proximity: larger + lower in frame => closer (same scale idea as AprilTag ratio)."""
+    """Monocular proximity: larger + lower in frame => closer."""
     h, w = frame_shape
     x1, y1, x2, y2 = bbox
     area_norm = ((x2 - x1) * (y2 - y1)) / max(1.0, float(w * h))
@@ -407,10 +361,7 @@ def estimate_leader_distance_from_yolo(
     frame_bgr,
     cfg: Dict[str, Any],
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Pick the best in-lane truck box as the leader; return (distance_signal, confidence).
-    Used when leader_tag_ids is empty (no AprilTag on leader back).
-    """
+    """Pick the best in-lane truck box as the leader; return (distance_signal, confidence)."""
     if frame_bgr is None:
         return None, None
 
@@ -447,24 +398,12 @@ def estimate_leader_distance_from_yolo(
 
 def estimate_follower_distance_signal(
     frame_bgr,
-    frame_gray,
-    frame_shape: Optional[Tuple[int, int]],
     cfg: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[Any]]:
-    """
-    AprilTag on leader if configured; otherwise YOLO truck box (hybrid convoy spacing).
-    """
-    leader_tag_ids = set(int(x) for x in cfg.get("leader_tag_ids", []))
-    if leader_tag_ids:
-        detections = _detect_apriltags(frame_gray)
-        signal, tag_id = estimate_leader_distance_signal(detections, frame_shape, cfg)
-        return signal, tag_id
-
+) -> Tuple[Optional[float], Optional[float]]:
+    """YOLO truck box spacing when enabled; otherwise HTTP-only (no distance signal)."""
     if not cfg.get("leader_yolo_enabled", True):
         return None, None
-
-    signal, conf = estimate_leader_distance_from_yolo(frame_bgr, cfg)
-    return signal, conf
+    return estimate_leader_distance_from_yolo(frame_bgr, cfg)
 
 
 def _get_lane_agent() -> LaneServoingAgent:
@@ -601,25 +540,18 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     commanded_speed = 0.0
     prev_mode = None
     last_distance_meta = None
-    leader_tag_ids = set(int(x) for x in cfg.get("leader_tag_ids", []))
-    use_yolo_spacing = not leader_tag_ids and bool(cfg.get("leader_yolo_enabled", True))
-    if use_yolo_spacing:
-        print("[Project][Follower] Leader spacing: HTTP + YOLO truck (no leader AprilTag).")
-    elif leader_tag_ids:
-        print(f"[Project][Follower] Leader spacing: HTTP + AprilTag ids={sorted(leader_tag_ids)}.")
+    if bool(cfg.get("leader_yolo_enabled", True)):
+        print("[Project][Follower] Leader spacing: HTTP + YOLO truck.")
     else:
         print("[Project][Follower] Leader spacing: HTTP only.")
 
     while not stop_event.is_set():
         now = time.time()
-        frame_bgr, frame_gray = _extract_frame_gray(camera)
-        frame_shape = None if frame_bgr is None else frame_bgr.shape[:2]
+        frame_bgr, _ = _extract_frame_gray(camera)
 
         distance_signal = None
         distance_meta = None
-        distance_signal, distance_meta = estimate_follower_distance_signal(
-            frame_bgr, frame_gray, frame_shape, cfg
-        )
+        distance_signal, distance_meta = estimate_follower_distance_signal(frame_bgr, cfg)
         if distance_meta is not None:
             last_distance_meta = distance_meta
 

@@ -8,7 +8,7 @@ loop_hz: 20
 
 follower_max_speed: 0.20
 follower_min_speed: 0.0
-# Normalized leader proximity (YOLO truck or AprilTag). Tune while following in sim/hardware.
+# Normalized leader proximity from YOLO truck box. Tune while following in sim/hardware.
 distance_target: 0.05
 distance_kp: 0.6
 leader_timeout_s: 0.4
@@ -23,9 +23,8 @@ decel_steps: 8
 # AprilTag event mapping (fill real IDs from your sign set)
 stop_tag_ids: [20,21,22,23,24,25,26,27,28,29]
 slow_tag_ids: [39]
-leader_tag_ids: []
 
-# Follower leader spacing without AprilTag on leader (YOLO class "truck" = Duckiebot)
+# Follower leader spacing (YOLO class "truck" = leader Duckiebot)
 leader_yolo_enabled: true
 leader_class_id: 1
 leader_center_roi: 0.65
