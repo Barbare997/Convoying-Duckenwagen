@@ -4,10 +4,9 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
  
 import cv2
-import requests
+import requests #HTTP requests to leader
 import yaml
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
- 
  
 _CONFIG_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "project_config.yaml")
@@ -67,7 +66,6 @@ def load_config() -> Dict[str, Any]:
  
     return {
         "role": str(cfg.get("role", "leader")).strip().lower(),
-        "loop_hz": float(cfg.get("loop_hz", 20)),
         "leader_host": str(cfg.get("leader_host", "127.0.0.1")).strip(),
         "leader_port": int(cfg.get("leader_port", 5055)),
         "cruise_speed": float(cfg.get("cruise_speed", 0.2)),
@@ -93,6 +91,9 @@ def load_config() -> Dict[str, Any]:
         "leader_center_roi": float(cfg.get("leader_center_roi", 0.65)),
         "leader_min_bbox_area": int(cfg.get("leader_min_bbox_area", 400)),
         "leader_min_y2_frac": float(cfg.get("leader_min_y2_frac", 0.25)),
+        # True: send LaneServoingAgent PWM as-is (same as visual_lane_servoing task).
+        # False: scale PWM so max(left,right) = cruise/slow speed from this file.
+        "lane_use_direct_pwm": bool(cfg.get("lane_use_direct_pwm", False)),
     }
  
  
@@ -187,6 +188,7 @@ def _get_apriltag_detector():
     return _apriltag_detector
 
 
+#extracts the frame from the camera and converts it to grayscale
 def _extract_frame_gray(camera) -> Tuple[Optional[Any], Optional[Any]]:
     if camera is None:
         return None, None
@@ -260,7 +262,7 @@ def _classify_event_from_detections(
 def detect_sign_event(
     detections: List[Any],
     frame_shape: Optional[Tuple[int, int]],
-    cfg: Dict[str, Any],
+    cfg: Dict[str, Any], 
 ) -> str:
     stop_ids = set(int(x) for x in cfg.get("stop_tag_ids", []))
     slow_ids = set(int(x) for x in cfg.get("slow_tag_ids", []))
@@ -413,9 +415,34 @@ def _get_lane_agent() -> LaneServoingAgent:
     return _lane_agent
 
 
+def _apply_lane_wheels(
+    wheels,
+    left: float,
+    right: float,
+    speed_cap: float,
+    use_direct_pwm: bool,
+) -> None:
+    """Drive from lane agent: direct PWM (lane task) or scaled to speed_cap (convoy cap)."""
+    if wheels is None:
+        return
+    if use_direct_pwm:
+        wheels.set_wheels_speed(min(1.0, float(left)), min(1.0, float(right)))
+        return
+    peak = max(1e-6, max(float(left), float(right)))
+    scale = max(0.0, float(speed_cap)) / peak
+    wheels.set_wheels_speed(
+        min(1.0, float(left) * scale),
+        min(1.0, float(right) * scale),
+    )
+
+
+def _sleep_if_no_frame(frame_bgr) -> None:
+    """Match visual_lane_servoing: run per camera frame, brief wait only when no frame."""
+    if frame_bgr is None:
+        time.sleep(0.01)
+
+
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
-    loop_hz = max(1.0, float(cfg.get("loop_hz", 20)))
-    dt = 1.0 / loop_hz
     status_hz = max(1.0, float(cfg.get("status_publish_hz", 10)))
     status_dt = 1.0 / status_hz
     cruise_speed = float(cfg.get("cruise_speed", 0.2))
@@ -423,7 +450,12 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     stop_hold_s = float(cfg.get("stop_hold_s", 2.0))
     decel_time_s = float(cfg.get("decel_time_s", 0.8))
     decel_steps = int(cfg.get("decel_steps", 8))
-    print(f"[Project][Leader] FSM loop started at {loop_hz:.1f} Hz.")
+    lane_direct = bool(cfg.get("lane_use_direct_pwm", False))
+    print("[Project][Leader] Control loop: one update per camera frame (like visual_lane_servoing).")
+    if lane_direct:
+        print("[Project][Leader] Lane PWM: direct (speed/P-gain from lane_servoing_config.yaml).")
+    else:
+        print("[Project][Leader] Lane PWM: scaled to cruise_speed / slow_speed.")
  
     last_log = 0.0
     last_status_pub = 0.0
@@ -472,8 +504,9 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
-                scale = current_speed / max(1e-6, max(left, right))
-                wheels.set_wheels_speed(min(1.0, left * scale), min(1.0, right * scale))
+                current_speed = max(0.0, slow_speed)
+                # Slow sign: always cap to slow_speed (convoy), not full lane task speed.
+                _apply_lane_wheels(wheels, left, right, slow_speed, use_direct_pwm=False)
             elif wheels is not None:
                 wheels.set_wheels_speed(current_speed, current_speed)
         else:
@@ -483,8 +516,9 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
-                scale = current_speed / max(1e-6, max(left, right))
-                wheels.set_wheels_speed(min(1.0, left * scale), min(1.0, right * scale))
+                cap = current_speed if not lane_direct else max(left, right)
+                current_speed = max(0.0, float(cap))
+                _apply_lane_wheels(wheels, left, right, cruise_speed, lane_direct)
             elif wheels is not None:
                 wheels.set_wheels_speed(current_speed, current_speed)
 
@@ -505,7 +539,7 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 f"event={last_event} tags={last_tag_ids}"
             )
             last_log = now
-        time.sleep(dt)
+        _sleep_if_no_frame(frame_bgr)
  
     set_leader_status(build_status_payload(STATE_STOPPED, 0.0))
     _safe_stop(wheels)
@@ -513,8 +547,6 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
  
  
 def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
-    loop_hz = max(1.0, float(cfg.get("loop_hz", 20)))
-    dt = 1.0 / loop_hz
     poll_hz = max(1.0, float(cfg.get("status_poll_hz", 10)))
     poll_dt = 1.0 / poll_hz
     request_timeout_s = float(cfg.get("request_timeout_s", 0.2))
@@ -530,15 +562,18 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     decel_time_s = float(cfg.get("decel_time_s", 0.8))
     decel_steps = int(cfg.get("decel_steps", 8))
     status_url = f"http://{leader_host}:{leader_port}/convoy/status"
-    print(f"[Project][Follower] Polling loop started at {loop_hz:.1f} Hz.")
+    print("[Project][Follower] Lane control: one update per camera frame (like visual_lane_servoing).")
+    print(f"[Project][Follower] HTTP + YOLO spacing polled at {poll_hz:.1f} Hz.")
  
     last_log = 0.0
     last_poll = 0.0
+    last_yolo = 0.0
     latest = build_status_payload(STATE_STOPPED, 0.0)
     mode = EVENT_TIMEOUT
     target_speed = 0.0
     commanded_speed = 0.0
     prev_mode = None
+    last_distance_signal = None
     last_distance_meta = None
     if bool(cfg.get("leader_yolo_enabled", True)):
         print("[Project][Follower] Leader spacing: HTTP + YOLO truck.")
@@ -549,11 +584,15 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         now = time.time()
         frame_bgr, _ = _extract_frame_gray(camera)
 
-        distance_signal = None
-        distance_meta = None
-        distance_signal, distance_meta = estimate_follower_distance_signal(frame_bgr, cfg)
-        if distance_meta is not None:
-            last_distance_meta = distance_meta
+        distance_signal = last_distance_signal
+        if now - last_yolo >= poll_dt:
+            yolo_signal, distance_meta = estimate_follower_distance_signal(frame_bgr, cfg)
+            if yolo_signal is not None:
+                last_distance_signal = yolo_signal
+                distance_signal = yolo_signal
+            if distance_meta is not None:
+                last_distance_meta = distance_meta
+            last_yolo = now
 
         if now - last_poll >= poll_dt:
             try:
@@ -600,8 +639,8 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
-                scale = commanded_speed / max(1e-6, max(left, right))
-                wheels.set_wheels_speed(min(1.0, left * scale), min(1.0, right * scale))
+                # Follower always scales to commanded_speed (leader HTTP + YOLO spacing).
+                _apply_lane_wheels(wheels, left, right, commanded_speed, use_direct_pwm=False)
             elif wheels is not None:
                 wheels.set_wheels_speed(commanded_speed, commanded_speed)
 
@@ -617,7 +656,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 f"dist_signal={distance_signal} dist_meta={last_distance_meta}"
             )
             last_log = now
-        time.sleep(dt)
+        _sleep_if_no_frame(frame_bgr)
  
     _safe_stop(wheels)
     print("[Project][Follower] Stopped.")

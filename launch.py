@@ -362,6 +362,17 @@ def package_task(task_name):
                     arc = f'tasks/{dep[0]}/{dep[1]}'
                     print(f"   Adding dependency: {arc}/")
                     tar.add(dep_path, arcname=arc, filter=no_pycache)
+            templates_dir = os.path.join(PROJECT_ROOT, 'servers', 'templates')
+            if os.path.exists(templates_dir):
+                print("   Adding dependency: servers/templates/")
+                tar.add(templates_dir, arcname='servers/templates', filter=no_pycache)
+            vls_dir = os.path.join(PROJECT_ROOT, 'servers', 'visual_lane_servoing')
+            for rel in ('__init__.py', 'visualization.py'):
+                vls_file = os.path.join(vls_dir, rel)
+                if os.path.isfile(vls_file):
+                    arc = f'servers/visual_lane_servoing/{rel}'
+                    print(f"   Adding dependency: {arc}")
+                    tar.add(vls_file, arcname=arc, filter=no_pycache)
 
     buf.seek(0)
     print("Package created!")

@@ -2,19 +2,26 @@ role: leader
 leader_host: kvati.local
 leader_port: 5055
 
-cruise_speed: 0.20
-slow_speed: 0.12
-loop_hz: 20
+# Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
+# Follower always scales lane PWM to cruise_speed / leader status / YOLO.
+lane_use_direct_pwm: true
+cruise_speed: 0.30
+slow_speed: 0.20
 
-follower_max_speed: 0.20
+follower_max_speed: 0.30
 follower_min_speed: 0.0
 # Normalized leader proximity from YOLO truck box. Tune while following in sim/hardware.
 distance_target: 0.05
+#error = distance_target - distance_signal, target_speed += distance_kp * error
 distance_kp: 0.6
+#If follower’s last successful leader status is older than 0.4 seconds, treat leader as lost → stop.
 leader_timeout_s: 0.4
 
+#leader updates its status every status_publish_hz times per second
 status_publish_hz: 10
+#follower asks leader's status every status_poll_hz times per second
 status_poll_hz: 10
+#Each HTTP request to leader waits max 0.2 s before giving up that poll.
 request_timeout_s: 0.2
 stop_hold_s: 2.0
 decel_time_s: 0.8
@@ -27,11 +34,16 @@ slow_tag_ids: [39]
 # Follower leader spacing (YOLO class "truck" = leader Duckiebot)
 leader_yolo_enabled: true
 leader_class_id: 1
+#If the leader is detected in the Rregion of interest, follower will try to follow it.
 leader_center_roi: 0.65
-leader_min_bbox_area: 400
+leader_min_bbox_area: 500
+#If the leader's bounding box is not at least 0.25 of the image height, follower will not try to follow it.
 leader_min_y2_frac: 0.25
 
 # Detection stability controls
+#Leader must see the same sign event 3 times in a row before accepting it, stops 1-frame glitch from trigerring stop/slow.
 sign_confirm_frames: 3
+#Hold active sign event during cooldown to reduce flicker near signs.
 sign_cooldown_s: 2.0
+#If the sign is detected in the Rregion of interest, follower will try to follow it.
 sign_center_roi: 1.0

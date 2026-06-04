@@ -22,7 +22,7 @@ class DummyWheels:
 def _run_and_stop(loop_fn, timeout_s: float = 0.2):
     stop_event = threading.Event()
     wheels = DummyWheels()
-    cfg = {"loop_hz": 20}
+    cfg = {}
 
     t = threading.Thread(
         target=loop_fn,
@@ -60,7 +60,6 @@ def test_config_loads():
     cfg = agent.load_config()
     assert isinstance(cfg, dict), "Config must be a dictionary"
     assert "role" in cfg, "Config missing role"
-    assert "loop_hz" in cfg, "Config missing loop_hz"
     assert "leader_yolo_enabled" in cfg, "Config missing leader_yolo_enabled"
     print("OK: config loads")
 
@@ -111,13 +110,13 @@ def test_role_dispatch():
         agent.run_leader = fake_leader
         agent.run_follower = fake_follower
 
-        agent.load_config = lambda: {"role": "leader", "loop_hz": 20}
+        agent.load_config = lambda: {"role": "leader"}
         agent.main(None, None, None, threading.Event())
         assert called["leader"] == 1 and called["follower"] == 0, "Leader dispatch failed"
 
         called["leader"] = 0
         called["follower"] = 0
-        agent.load_config = lambda: {"role": "follower", "loop_hz": 20}
+        agent.load_config = lambda: {"role": "follower"}
         agent.main(None, None, None, threading.Event())
         assert called["follower"] == 1 and called["leader"] == 0, "Follower dispatch failed"
         print("OK: role dispatch works")
