@@ -9,6 +9,7 @@ A robotics education platform for the Duckiebot DB21J. Students complete program
 Install these extensions (search by name in the Extensions panel):
 
 | Extension | Why |
+
 |-----------|-----|
 | **Python** (`ms-python.python`) | Python language support, linting, debugging |
 | **Pylance** (`ms-python.vscode-pylance`) | Fast type checking and autocomplete (installed automatically with Python) |

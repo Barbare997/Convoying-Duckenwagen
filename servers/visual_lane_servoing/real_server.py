@@ -1,6 +1,7 @@
 import sys
 import os
-import threading
+import signal
+import argparse
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.join(script_dir, '..', '..')
@@ -16,9 +17,9 @@ from servers.visual_lane_servoing.visualization import create_lane_visualization
 from servers.visual_lane_servoing.color_sample import sample_pixel_from_frame_bgr
 from servers.templates.lane_servoing import LANE_SERVOING_TEMPLATE as HTML_TEMPLATE
 
-from duckiebot.wheel_driver.godot_wheels_driver import GodotWheelsDriver
+from duckiebot.camera_driver import CameraDriver
+from duckiebot.wheel_driver import DaguWheelsDriver
 from duckiebot.wheel_driver.wheels_driver_abs import WheelPWMConfiguration
-from duckiebot.camera_driver.godot_camera_driver import GodotCameraDriver, GodotCameraConfig
 from launcher.ports import find_available_port
 from servers.common import make_frame_generator, shutdown_cleanup, suppress_http_logs
 
@@ -33,31 +34,37 @@ def _get_student_module():
 
 app = Flask(__name__)
 
-camera  = None
-wheels  = None
-agent   = None
+camera = None
+wheels = None
+agent = None
 running = False
-stop_event = threading.Event()
+stop_event = __import__('threading').Event()
 
 
-def visualize(frame):
-    """frame is RGB from Godot camera."""
+def visualize(frame_bgr):
     global running
-    if agent is None or wheels is None:
-        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    if agent is None or wheels is None or frame_bgr is None:
+        if frame_bgr is not None:
+            return frame_bgr
+        import numpy as np
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(blank, "Waiting for camera...", (160, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 2)
+        return blank
 
-    pwm_left, pwm_right = agent.compute_commands(frame)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pwm_left, pwm_right = agent.compute_commands(frame_rgb)
     if running:
         wheels.set_wheels_speed(pwm_left, pwm_right)
     else:
         wheels.set_wheels_speed(0.0, 0.0)
-    debug_info = agent.last_debug_info
 
-    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    return create_lane_visualization(bgr, debug_info, pwm_left, pwm_right)
+    return create_lane_visualization(
+        frame_bgr, agent.last_debug_info, pwm_left, pwm_right
+    )
 
 
-generate_frames = make_frame_generator(lambda: camera, visualize, quality=50)
+generate_frames = make_frame_generator(lambda: camera, visualize, quality=50, rgb=False)
 
 
 @app.route('/')
@@ -73,26 +80,21 @@ def video():
 @app.route('/reset', methods=['POST'])
 def reset():
     if wheels is not None:
-        wheels.reset_game()
-    if agent is not None:
-        agent._last_steering = 0.0
-    if wheels is not None and agent is not None:
-        spd = agent.base_speed
-        wheels.set_wheels_speed(spd, spd)
+        wheels.set_wheels_speed(0.0, 0.0)
     return jsonify({'status': 'ok'})
 
 
 @app.route('/update_config', methods=['POST'])
 def update_config():
     data = request.json
-    agent.p_gain     = float(data.get('k_d',   agent.p_gain))
-    agent.d_gain     = float(data.get('k_phi', agent.d_gain))
+    agent.p_gain = float(data.get('k_d', agent.p_gain))
+    agent.d_gain = float(data.get('k_phi', agent.d_gain))
     agent.base_speed = float(data.get('const', agent.base_speed))
     try:
         with open(LANE_CONFIG_FILE, 'r') as f:
             saved = yaml.safe_load(f) or {}
-        saved['p_gain']     = agent.p_gain
-        saved['d_gain']     = agent.d_gain
+        saved['p_gain'] = agent.p_gain
+        saved['d_gain'] = agent.d_gain
         saved['base_speed'] = agent.base_speed
         with open(LANE_CONFIG_FILE, 'w') as f:
             yaml.dump(saved, f, default_flow_style=False)
@@ -108,7 +110,6 @@ def get_hsv():
 
 @app.route('/sample_pixel', methods=['POST'])
 def sample_pixel():
-    """Sample BGR/HSV at a click on the Camera panel (top-left of the stream)."""
     if agent is None:
         return jsonify({'ok': False, 'error': 'Agent not initialized'}), 503
 
@@ -138,8 +139,8 @@ def update_hsv():
     mod.set_hsv_bounds(
         [current['yellow_lower_h'], current['yellow_lower_s'], current['yellow_lower_v']],
         [current['yellow_upper_h'], current['yellow_upper_s'], current['yellow_upper_v']],
-        [current['white_lower_h'],  current['white_lower_s'],  current['white_lower_v']],
-        [current['white_upper_h'],  current['white_upper_s'],  current['white_upper_v']],
+        [current['white_lower_h'], current['white_lower_s'], current['white_lower_v']],
+        [current['white_upper_h'], current['white_upper_s'], current['white_upper_v']],
     )
     try:
         with open(LANE_HSV_CONFIG_FILE, 'w') as f:
@@ -159,7 +160,7 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    global running, wheels
+    global running
     running = False
     if wheels:
         wheels.set_wheels_speed(0.0, 0.0)
@@ -179,61 +180,59 @@ def status():
     return jsonify({
         'status': 'active',
         'frame_count': agent.frame_count,
-        'config': {'p_gain': agent.p_gain, 'd_gain': agent.d_gain,
-                   'base_speed': agent.base_speed, 'detection_threshold': agent.detection_threshold},
+        'config': {
+            'p_gain': agent.p_gain,
+            'd_gain': agent.d_gain,
+            'base_speed': agent.base_speed,
+            'detection_threshold': agent.detection_threshold,
+        },
     })
 
 
 def main():
     global camera, wheels, agent
 
-    import argparse
-    ap = argparse.ArgumentParser(description="Virtual Lane Servoing Server")
-    ap.add_argument("--port",       type=int, default=5000)
-    ap.add_argument("--frame-port", type=int, default=5001)
-    ap.add_argument("--wheel-port", type=int, default=5002)
-    ap.add_argument("--godot-host", type=str, default="localhost")
+    ap = argparse.ArgumentParser(description='Lane Servoing Server — Real Hardware')
+    ap.add_argument('--port', type=int, default=5000)
     args = ap.parse_args()
 
     suppress_http_logs()
-    print("=" * 60)
-    print("VIRTUAL LANE SERVOING SERVER")
-    print("=" * 60)
+    print('=' * 60)
+    print('LANE SERVOING SERVER — REAL HARDWARE')
+    print('=' * 60)
 
-    print("\n[1/3] Initializing wheels driver...")
-    wheels = GodotWheelsDriver(
-        WheelPWMConfiguration(pwm_min=0), WheelPWMConfiguration(pwm_min=0),
-        godot_host=args.godot_host,
-        godot_port=args.wheel_port,
-    )
-    wheels.trim = 0
-    print(f"  Wheels: {args.godot_host}:{args.wheel_port}")
+    print('\n[1/3] Initializing wheels driver...')
+    wheels = DaguWheelsDriver(WheelPWMConfiguration(), WheelPWMConfiguration())
+    print('  Wheels: ok')
 
-    print("\n[2/3] Initializing camera driver...")
-    print(f"  Waiting for Godot on port {args.frame_port}...")
-    camera = GodotCameraDriver(godot_config=GodotCameraConfig(host="0.0.0.0", port=args.frame_port))
+    print('\n[2/3] Initializing camera driver...')
+    camera = CameraDriver()
     camera.start()
-    print("  Camera: connected!")
+    print('  Camera: ok')
 
-    print("\n[3/3] Creating agent...")
+    print('\n[3/3] Creating agent...')
     agent = LaneServoingAgent()
-    print(f"  p_gain={agent.p_gain}, d_gain={agent.d_gain}, base_speed={agent.base_speed}")
+    print(f'  p_gain={agent.p_gain}, d_gain={agent.d_gain}, base_speed={agent.base_speed}')
+
+    def _shutdown(signum, frame):
+        print('\nShutting down...')
+        shutdown_cleanup(wheels, camera, stop_event)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     web_port = find_available_port(args.port)
-    if web_port != args.port:
-        print(f"  Port {args.port} busy, using {web_port}")
-
-    print("\n" + "=" * 60)
-    print(f"Web Interface: http://localhost:{web_port}")
-    print("=" * 60 + "\n")
+    print(f'\nWeb Interface: http://localhost:{web_port}')
+    print('Click the Camera panel (top-left) to sample HSV.\n')
 
     try:
-        app.run(host='127.0.0.1', port=web_port, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=web_port, debug=False, threaded=True)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print('\nShutting down...')
     finally:
         shutdown_cleanup(wheels, camera, stop_event)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

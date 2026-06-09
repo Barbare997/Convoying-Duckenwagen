@@ -16,6 +16,24 @@ _LINE_OFFSET = 160
 _ROI_START   = 0.47
 _NUM_SLICES  = 3
 _SLICE_TOL   = 5
+# Small nudge toward lane center (keep symmetric — large white bias caused false right steer).
+_YELLOW_CENTER_BIAS_PX = 8
+_YELLOW_FAR_SLICE_BIAS_PX = 10
+_WHITE_CENTER_BIAS_PX = 3
+
+
+def _largest_component_cols(strip: np.ndarray) -> np.ndarray:
+    """Ignore small noise blobs; use the main lane marking in this row."""
+    idx = np.where(strip > 0)[1]
+    if len(idx) == 0:
+        return idx
+    if len(idx) < 25:
+        return idx
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(strip, connectivity=8)
+    if num_labels <= 1:
+        return idx
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return np.where(labels == best)[1]
 
 
 def detect_lines_in_slices(
@@ -23,22 +41,27 @@ def detect_lines_in_slices(
     mask_white:  np.ndarray,
     h: int,
 ) -> Tuple[list, list]:
+    w = mask_yellow.shape[1]
     slice_height = int(h * 0.35 / _NUM_SLICES)
     start_y      = int(h * _ROI_START)
     yellow_xs, white_xs = [], []
 
     for i in range(_NUM_SLICES):
         y = start_y + i * slice_height + slice_height // 2
+        far_frac = (_NUM_SLICES - 1 - i) / max(1, _NUM_SLICES - 1)
 
         strip_y = mask_yellow[y - _SLICE_TOL: y + _SLICE_TOL, :]
-        idx = np.where(strip_y > 0)[1]
+        idx = _largest_component_cols(strip_y)
         if len(idx) > 0:
-            yellow_xs.append(int(np.mean(idx)))
+            # 90th %ile ≈ inner edge on dashed yellow; max alone sits left of visible paint.
+            y_edge = int(np.percentile(idx, 90))
+            y_inset = int(_YELLOW_CENTER_BIAS_PX + far_frac * _YELLOW_FAR_SLICE_BIAS_PX)
+            yellow_xs.append(min(w - 1, y_edge + y_inset))
 
         strip_w = mask_white[y - _SLICE_TOL: y + _SLICE_TOL, :]
-        idx = np.where(strip_w > 0)[1]
+        idx = _largest_component_cols(strip_w)
         if len(idx) > 0:
-            white_xs.append(int(np.mean(idx)))
+            white_xs.append(max(0, int(np.min(idx)) - _WHITE_CENTER_BIAS_PX))
 
     return yellow_xs, white_xs
 
@@ -71,18 +94,30 @@ class LaneServoingAgent:
         self._right_history     = deque(maxlen=3)
         self.last_debug_info    = self._empty_debug_info(480, 640)
 
+    def _weighted_line_x(self, xs: list) -> float:
+        """Weight lower slices (closer to robot) more than far slices."""
+        if not xs:
+            return 0.0
+        if len(xs) == 1:
+            return float(xs[0])
+        weights = np.linspace(0.2, 1.0, num=len(xs), dtype=np.float64)
+        weights /= weights.sum()
+        return float(np.dot(weights, xs))
+
     def _calculate_error(self, yellow_xs, white_xs, left_det, right_det, w):
         if left_det and right_det and yellow_xs and white_xs:
-            y_mean = float(np.mean(yellow_xs))
-            w_mean = float(np.mean(white_xs))
-            measured = (w_mean - y_mean) / 2.0
+            y_pos = self._weighted_line_x(yellow_xs)
+            w_pos = self._weighted_line_x(white_xs)
+            measured = (w_pos - y_pos) / 2.0
             if measured > 20:
                 self._lane_half_width = 0.9 * self._lane_half_width + 0.1 * measured
-            error = w / 2.0 - (y_mean + w_mean) / 2.0
+            error = w / 2.0 - (y_pos + w_pos) / 2.0
         elif left_det and yellow_xs:
-            error = w / 2.0 - (float(np.mean(yellow_xs)) + self._lane_half_width)
+            y_pos = self._weighted_line_x(yellow_xs)
+            error = w / 2.0 - (y_pos + self._lane_half_width)
         elif right_det and white_xs:
-            error = w / 2.0 - (float(np.mean(white_xs)) - self._lane_half_width)
+            w_pos = self._weighted_line_x(white_xs)
+            error = w / 2.0 - (w_pos - self._lane_half_width)
         else:
             error = self._prev_error
 
@@ -144,6 +179,7 @@ class LaneServoingAgent:
         combined = np.clip(mask_left + mask_right, 0, 1)
         self.last_debug_info = {
             'roi':               image,
+            'frame_bgr':         bgr,
             'lane_mask':         (combined * 255).astype(np.uint8),
             'white_mask':        mask_w,
             'yellow_mask':       mask_y,
@@ -176,6 +212,7 @@ class LaneServoingAgent:
             'slice_ys':  [start_y + i * slice_height + slice_height // 2 for i in range(_NUM_SLICES)],
             'is_curve':  is_curve,
             'curve_dir': curve_dir,
+            'lateral_error': float(np.clip(self._filtered_error, -1.0, 1.0)),
         })
 
         return left, right

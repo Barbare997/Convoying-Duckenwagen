@@ -20,7 +20,7 @@ _white_upper = np.array([_h.get('white_upper_h', 0), _h.get('white_upper_s', 0),
 def detect_lane_markings(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # 1) Ignore the horizon: lane pixels are expected in the lower image area.
     h, w = image.shape[:2]
-    crop_top = int(h * 0.4)
+    crop_top = int(h * 0.3)
     roi = image[crop_top:, :]
 
     # 2) Blur to reduce high-frequency noise before color thresholding.

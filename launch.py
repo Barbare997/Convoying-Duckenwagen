@@ -351,6 +351,12 @@ def package_task(task_name):
         if os.path.exists(task_server_dir):
             print(f"   Adding server: servers/{task_name}/")
             tar.add(task_server_dir, arcname=f'servers/{task_name}', filter=no_pycache)
+        if task_name == 'visual_lane_servoing':
+            templates_dir = os.path.join(PROJECT_ROOT, 'servers', 'templates')
+            if os.path.exists(templates_dir):
+                print("   Adding dependency: servers/templates/")
+                tar.add(templates_dir, arcname='servers/templates', filter=no_pycache)
+
         if task_name == 'project':
             for dep in (
                 ('object_detection', 'packages'),
@@ -367,7 +373,7 @@ def package_task(task_name):
                 print("   Adding dependency: servers/templates/")
                 tar.add(templates_dir, arcname='servers/templates', filter=no_pycache)
             vls_dir = os.path.join(PROJECT_ROOT, 'servers', 'visual_lane_servoing')
-            for rel in ('__init__.py', 'visualization.py'):
+            for rel in ('__init__.py', 'visualization.py', 'color_sample.py'):
                 vls_file = os.path.join(vls_dir, rel)
                 if os.path.isfile(vls_file):
                     arc = f'servers/visual_lane_servoing/{rel}'

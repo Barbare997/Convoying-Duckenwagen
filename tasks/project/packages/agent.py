@@ -49,6 +49,8 @@ _sign_runtime = {
     "active_until": 0.0,
 }
 _lane_agent: Optional[LaneServoingAgent] = None
+_driving_enabled = False
+_driving_lock = threading.Lock()
 _detection_agent = None
 _detection_init_attempted = False
 
@@ -408,11 +410,49 @@ def estimate_follower_distance_signal(
     return estimate_leader_distance_from_yolo(frame_bgr, cfg)
 
 
+def set_lane_agent(lane_agent: LaneServoingAgent) -> None:
+    """Use one LaneServoingAgent from the server (same as visual_lane_servoing)."""
+    global _lane_agent
+    _lane_agent = lane_agent
+
+
+def set_driving_enabled(enabled: bool) -> None:
+    global _driving_enabled
+    with _driving_lock:
+        _driving_enabled = bool(enabled)
+
+
+def is_driving_enabled() -> bool:
+    with _driving_lock:
+        return _driving_enabled
+
+
 def _get_lane_agent() -> LaneServoingAgent:
     global _lane_agent
     if _lane_agent is None:
         _lane_agent = LaneServoingAgent()
     return _lane_agent
+
+
+def _remember_lane_pwm(lane_agent: LaneServoingAgent, left: float, right: float) -> None:
+    lane_agent._last_left = float(left)
+    lane_agent._last_right = float(right)
+
+
+def _maybe_drive_wheels(
+    wheels,
+    left: float,
+    right: float,
+    speed_cap: float,
+    use_direct_pwm: bool,
+) -> None:
+    """Apply lane PWM only when UI Start is active (same as visual_lane_servoing)."""
+    if wheels is None:
+        return
+    if not is_driving_enabled():
+        _safe_stop(wheels)
+        return
+    _apply_lane_wheels(wheels, left, right, speed_cap, use_direct_pwm)
 
 
 def _apply_lane_wheels(
@@ -489,13 +529,17 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             state = proposed
 
         if state == STATE_STOPPING:
-            smooth_stop(wheels, current_speed, decel_time_s, decel_steps, stop_event)
+            if is_driving_enabled():
+                smooth_stop(wheels, current_speed, decel_time_s, decel_steps, stop_event)
+            else:
+                _safe_stop(wheels)
             current_speed = 0.0
             state = STATE_STOPPED
             stop_until = time.time() + stop_hold_s
         elif state == STATE_STOPPED:
             current_speed = 0.0
             _safe_stop(wheels)
+            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
             if now >= stop_until and event == EVENT_NORMAL:
                 state = STATE_CRUISING
         elif state == STATE_SLOW:
@@ -504,11 +548,14 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
+                _remember_lane_pwm(lane_agent, left, right)
                 current_speed = max(0.0, slow_speed)
                 # Slow sign: always cap to slow_speed (convoy), not full lane task speed.
-                _apply_lane_wheels(wheels, left, right, slow_speed, use_direct_pwm=False)
-            elif wheels is not None:
+                _maybe_drive_wheels(wheels, left, right, slow_speed, use_direct_pwm=False)
+            elif wheels is not None and is_driving_enabled():
                 wheels.set_wheels_speed(current_speed, current_speed)
+            elif wheels is not None:
+                _safe_stop(wheels)
         else:
             state = STATE_CRUISING
             current_speed = max(0.0, cruise_speed)
@@ -516,11 +563,14 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
+                _remember_lane_pwm(lane_agent, left, right)
                 cap = current_speed if not lane_direct else max(left, right)
                 current_speed = max(0.0, float(cap))
-                _apply_lane_wheels(wheels, left, right, cruise_speed, lane_direct)
-            elif wheels is not None:
+                _maybe_drive_wheels(wheels, left, right, cruise_speed, lane_direct)
+            elif wheels is not None and is_driving_enabled():
                 wheels.set_wheels_speed(current_speed, current_speed)
+            elif wheels is not None:
+                _safe_stop(wheels)
 
         if now - last_status_pub >= status_dt:
             payload = build_status_payload(state, current_speed)
@@ -629,20 +679,27 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         if mode == EVENT_TIMEOUT:
             commanded_speed = 0.0
             _safe_stop(wheels)
+            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
         elif mode == STATE_STOPPED:
-            if commanded_speed > 0.0:
+            if commanded_speed > 0.0 and is_driving_enabled():
                 smooth_stop(wheels, commanded_speed, decel_time_s, decel_steps, stop_event)
+            else:
+                _safe_stop(wheels)
             commanded_speed = 0.0
+            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
         else:
             commanded_speed = target_speed
             if wheels is not None and frame_bgr is not None:
                 lane_agent = _get_lane_agent()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 left, right = lane_agent.compute_commands(frame_rgb)
+                _remember_lane_pwm(lane_agent, left, right)
                 # Follower always scales to commanded_speed (leader HTTP + YOLO spacing).
-                _apply_lane_wheels(wheels, left, right, commanded_speed, use_direct_pwm=False)
-            elif wheels is not None:
+                _maybe_drive_wheels(wheels, left, right, commanded_speed, use_direct_pwm=False)
+            elif wheels is not None and is_driving_enabled():
                 wheels.set_wheels_speed(commanded_speed, commanded_speed)
+            elif wheels is not None:
+                _safe_stop(wheels)
 
         if mode != prev_mode:
             print(f"[Project][Follower] transition {prev_mode} -> {mode}")
