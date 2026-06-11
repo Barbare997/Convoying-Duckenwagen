@@ -97,6 +97,8 @@ python launch.py --run --host 192.168.1.100
 
 This packages the task, transfers it to the robot over HTTP, and starts the server. The terminal prints the web interface URL when ready.
 
+**Project leader (AprilTag signs):** tries `import apriltags` first (what Duckiebot images often have), then `dt_apriltags` / `apriltag`, OpenCV, and `pupil-apriltags`. Stop signs use **stop-on-loss** by default (keep driving while the tag is visible; stop when it leaves the camera). Slow signs still trigger on sight. Or use **Convoy Sign Control** in the web UI (`Normal` / `Slow` / `Sign Stop`). Set `sign_source: both` or `manual` in `project_config.yaml`.
+
 ### Stop a task on the robot
 
 ---

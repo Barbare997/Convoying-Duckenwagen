@@ -52,13 +52,34 @@ from servers.common import make_frame_generator, shutdown_cleanup, suppress_http
 
 try:
 
-    from servers.project.camera_source import open_project_camera
+    from servers.project.camera_source import (
+        open_project_camera,
+        PlaceholderCamera,
+        WaitingCaptureCamera,
+        stop_project_camera,
+    )
 
 except Exception as e:
 
     open_project_camera = None
 
+    WaitingCaptureCamera = None
+
+    PlaceholderCamera = None
+
+    stop_project_camera = None
+
     print(f'[Project] camera_source unavailable ({e}), using direct CameraDriver')
+
+
+
+try:
+
+    from servers.object_detection.visualization import draw_detections
+
+except ModuleNotFoundError:
+
+    draw_detections = None
 
 
 
@@ -122,9 +143,24 @@ _frame_queue = queue.Queue(maxsize=1)
 
 _hw_ready    = threading.Event()
 _debug_lock  = threading.Lock()
+_direct_camera_fallback = False
 
 
-
+def _feed_convoy_frame(frame_bgr):
+    """When direct CameraDriver fallback is used, MJPEG is the only reader — feed the convoy queue."""
+    if frame_bgr is None:
+        return
+    try:
+        _frame_queue.put_nowait(frame_bgr.copy())
+    except queue.Full:
+        try:
+            _frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            _frame_queue.put_nowait(frame_bgr.copy())
+        except queue.Full:
+            pass
 
 
 class QueuedCamera:
@@ -205,6 +241,23 @@ def _refresh_display_masks(frame_bgr):
         _lane_agent.last_debug_info = debug
 
 
+def _apply_follower_yolo_overlay(frame_bgr):
+    """Draw all YOLO boxes on the camera panel (follower only, whenever model is loaded)."""
+    if frame_bgr is None or draw_detections is None:
+        return frame_bgr
+    try:
+        cfg = agent.load_config()
+        if str(cfg.get("role", "leader")).lower() != "follower":
+            return frame_bgr
+        detections = agent.fetch_yolo_detections(frame_bgr, cfg)
+        if not detections:
+            return frame_bgr
+        return draw_detections(frame_bgr.copy(), detections)
+    except Exception as e:
+        print(f'[Project] YOLO overlay error: {e}')
+        return frame_bgr
+
+
 def _visualize(frame_bgr):
     if frame_bgr is None:
         blank = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -212,18 +265,23 @@ def _visualize(frame_bgr):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 2)
         return blank
 
+    if _direct_camera_fallback:
+        _feed_convoy_frame(frame_bgr)
+
+    display_bgr = _apply_follower_yolo_overlay(frame_bgr)
+
     if _lane_agent is None or create_lane_visualization is None:
-        return frame_bgr
+        return display_bgr
 
     _refresh_display_masks(frame_bgr)
     debug = _lane_agent.last_debug_info or {}
     pwm_left = float(getattr(_lane_agent, '_last_left', 0.0))
     pwm_right = float(getattr(_lane_agent, '_last_right', 0.0))
     try:
-        return create_lane_visualization(frame_bgr, debug, pwm_left, pwm_right)
+        return create_lane_visualization(display_bgr, debug, pwm_left, pwm_right)
     except Exception as e:
         print(f'[Project] visualize error: {e}')
-        return frame_bgr
+        return display_bgr
 
 
 
@@ -297,31 +355,31 @@ def index():
 
     role = str(cfg.get('role', 'leader'))
 
-    if get_template is not None and _lane_agent is not None:
-
-        html = get_template(
-
-            title=f"Convoy Project — {socket.gethostname()}",
-
-            subtitle=f"{role} — real hardware",
-
-        )
-
-        return render_template_string(html, config=_lane_agent, hostname=socket.gethostname())
+    lane_cfg = _lane_agent if _lane_agent is not None else LaneServoingAgent()
 
     if get_template is not None:
 
-        placeholder = LaneServoingAgent()
+        if _hw_ready.is_set():
+
+            subtitle = f"{role} — real hardware"
+
+        elif camera is not None:
+
+            subtitle = f"{role} — camera connecting…"
+
+        else:
+
+            subtitle = f"{role} — starting…"
 
         html = get_template(
 
             title=f"Convoy Project — {socket.gethostname()}",
 
-            subtitle=f"{role} — starting…",
+            subtitle=subtitle,
 
         )
 
-        return render_template_string(html, config=placeholder, hostname=socket.gethostname())
+        return render_template_string(html, config=lane_cfg, hostname=socket.gethostname())
 
     return _fallback_index_html(role)
 
@@ -451,6 +509,10 @@ def shutdown():
 
         camera.stop()
 
+    if stop_project_camera is not None:
+
+        stop_project_camera()
+
     shutdown_cleanup(wheels, None, stop_event)
 
     return jsonify({'status': 'ok'})
@@ -469,6 +531,38 @@ def convoy_status():
 
 
 
+@app.route('/convoy/manual', methods=['POST'])
+
+def convoy_manual():
+
+    cfg = agent.load_config()
+
+    if str(cfg.get("role", "leader")).lower() != "leader":
+
+        return jsonify({'ok': False, 'error': 'Leader bot only'}), 403
+
+    data = request.json or {}
+
+    command = data.get('command') or data.get('mode')
+
+    if not command:
+
+        return jsonify({'ok': False, 'error': 'Missing command (CRUISING, SLOW, STOPPED)'}), 400
+
+    try:
+
+        result = agent.set_manual_convoy_command(command)
+
+        return jsonify(result)
+
+    except ValueError as e:
+
+        return jsonify({'ok': False, 'error': str(e)}), 400
+
+
+
+
+
 @app.route('/status')
 
 def status():
@@ -477,7 +571,9 @@ def status():
 
     payload = agent.get_leader_status()
 
-    payload["role"] = cfg.get("role", "leader")
+    payload['role'] = cfg.get('role', 'leader')
+
+    payload.update(agent.get_runtime_status(cfg))
 
     return jsonify(payload)
 
@@ -581,27 +677,59 @@ def sample_pixel():
 
 
 
+def _replace_camera(new_cam) -> None:
+    global camera
+    old = camera
+    camera = new_cam
+    if old is not None and old is not new_cam:
+        try:
+            old.stop()
+        except Exception:
+            pass
+
+
 def _open_camera():
 
-    global camera
+    global camera, _direct_camera_fallback
+
+    _direct_camera_fallback = False
 
     if open_project_camera is not None:
 
-        camera, mode = open_project_camera(_frame_queue, stop_event)
+        cam, mode = open_project_camera(_frame_queue, stop_event)
 
-        print(f'  Camera: ok ({mode})')
+        _replace_camera(cam)
+
+        if mode == "hardware":
+            print("  Camera: ok (shared capture)", flush=True)
+        else:
+            print("  Camera: will retry in background (preview active)", flush=True)
 
         return
 
+    for attempt in range(3):
 
+        try:
 
-    hw = CameraDriver()
+            hw = CameraDriver()
 
-    hw.start()
+            hw.start()
 
-    camera = hw
+            camera = hw
 
-    print('  Camera: ok (direct)')
+            _direct_camera_fallback = True
+
+            print('  Camera: ok (direct)', flush=True)
+
+            return
+
+        except Exception as e:
+
+            print(f'  Camera: direct attempt {attempt + 1}/3 failed ({e})', flush=True)
+
+            time.sleep(0.5)
+
+    print('  Camera: FAILED (nvargus busy?). Stop dashboard camera or restart bot.', flush=True)
 
 
 
@@ -628,6 +756,18 @@ def _init_hardware():
     global wheels, leds, _lane_agent
 
     try:
+
+        if _lane_agent is None:
+
+            _lane_agent = LaneServoingAgent()
+
+            _lane_agent._last_left = 0.0
+
+            _lane_agent._last_right = 0.0
+
+            agent.set_lane_agent(_lane_agent)
+
+        agent.set_driving_enabled(False)
 
         print('\n[1/5] Initializing LED driver...')
 
@@ -665,19 +805,21 @@ def _init_hardware():
 
         print('\n[4/5] Lane agent...')
 
-        _lane_agent = LaneServoingAgent()
+        if _lane_agent is None:
 
-        _lane_agent._last_left = 0.0
+            _lane_agent = LaneServoingAgent()
 
-        _lane_agent._last_right = 0.0
+            _lane_agent._last_left = 0.0
 
-        agent.set_lane_agent(_lane_agent)
+            _lane_agent._last_right = 0.0
+
+            agent.set_lane_agent(_lane_agent)
 
         agent.set_driving_enabled(False)
 
         print(f'  p_gain={_lane_agent.p_gain}, base_speed={_lane_agent.base_speed}')
 
-
+        _hw_ready.set()
 
         print('\n[5/5] Starting convoy agent...')
 
@@ -697,13 +839,15 @@ def _init_hardware():
 
         print('  agent.main() running')
 
-        _hw_ready.set()
-
     except Exception:
 
         print('[Project] Hardware init error:')
 
         traceback.print_exc()
+
+    finally:
+
+        _hw_ready.set()
 
 
 
@@ -738,6 +882,20 @@ def main():
     leds = None
 
     camera = None
+
+    _lane_agent = LaneServoingAgent()
+
+    _lane_agent._last_left = 0.0
+
+    _lane_agent._last_right = 0.0
+
+    agent.set_lane_agent(_lane_agent)
+
+    agent.set_driving_enabled(False)
+
+    if PlaceholderCamera is not None:
+        camera = PlaceholderCamera()
+        print("[Project] Camera placeholder active (no nvargus until hardware init)", flush=True)
 
 
 
@@ -779,15 +937,10 @@ def main():
 
     )
 
-    flask_thread.start()
-
-    time.sleep(0.5)
-
-
-
     hw_thread = threading.Thread(target=_init_hardware, name='HardwareInit', daemon=True)
-
     hw_thread.start()
+    print(f'[Project] Web UI starting on port {web_port} (hardware init in background)...', flush=True)
+    flask_thread.start()
 
 
 
@@ -812,6 +965,10 @@ def main():
         if camera is not None:
 
             camera.stop()
+
+        if stop_project_camera is not None:
+
+            stop_project_camera()
 
         shutdown_cleanup(wheels, None, stop_event)
 
@@ -848,6 +1005,10 @@ def main():
         if camera is not None:
 
             camera.stop()
+
+        if stop_project_camera is not None:
+
+            stop_project_camera()
 
         shutdown_cleanup(wheels, None, stop_event)
 

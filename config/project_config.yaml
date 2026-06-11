@@ -1,14 +1,20 @@
-role: leader
+role: follower
 leader_host: kvati.local
+# Must match leader project server port (real_server default 5000)
 leader_port: 5055
+
+
+# Sign input: both = UI buttons + AprilTags (buttons win when Slow/Stop latched)
+# Use manual on leader if AprilTags unavailable; follower always follows HTTP state.
+sign_source: both
 
 # Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
 # Follower always scales lane PWM to cruise_speed / leader status / YOLO.
 lane_use_direct_pwm: true
-cruise_speed: 0.30
-slow_speed: 0.20
+cruise_speed: 0.40
+slow_speed: 0.15
 
-follower_max_speed: 0.30
+follower_max_speed: 0.40
 follower_min_speed: 0.0
 # Normalized leader proximity from YOLO truck box. Tune while following in sim/hardware.
 distance_target: 0.05
@@ -24,8 +30,13 @@ status_poll_hz: 10
 #Each HTTP request to leader waits max 0.2 s before giving up that poll.
 request_timeout_s: 0.2
 stop_hold_s: 2.0
-decel_time_s: 0.8
-decel_steps: 8
+# Slow button: stay in SLOW this long, then auto-resume to CRUISING (follower follows via HTTP)
+slow_hold_s: 4.0
+# Sign Stop: ramp down over decel_time_s, hold stop_hold_s, then auto-resume
+decel_time_s: 1.2
+decel_steps: 10
+# Cruise <-> slow: ramp over this many seconds (not instant)
+speed_ramp_s: 1.0
 
 # AprilTag event mapping (fill real IDs from your sign set)
 stop_tag_ids: [20,21,22,23,24,25,26,27,28,29]
@@ -41,9 +52,26 @@ leader_min_bbox_area: 500
 leader_min_y2_frac: 0.25
 
 # Detection stability controls
-#Leader must see the same sign event 3 times in a row before accepting it, stops 1-frame glitch from trigerring stop/slow.
+# Slow sign: start slowing when tag pose distance <= sign_slow_distance_m (dt_apriltags pose_t).
+# Resume cruise when tag is lost (confirmed) and speed ramp to slow_speed is complete.
+sign_slow_mode: distance
+sign_slow_distance_m: 0.40
+sign_slow_loss_confirm_frames: 2
+sign_tag_size_m: 0.065
+# Camera intrinsics for AprilTag pose (640x480 Duckiebot defaults; tune if needed).
+camera_fx: 337.8
+camera_fy: 337.3
+camera_cx: 324.0
+camera_cy: 239.3
+camera_calib_width: 640
+camera_calib_height: 480
 sign_confirm_frames: 3
-#Hold active sign event during cooldown to reduce flicker near signs.
 sign_cooldown_s: 2.0
-#If the sign is detected in the Rregion of interest, follower will try to follow it.
 sign_center_roi: 1.0
+# Legacy time-based slow (sign_slow_mode: delay) — kept for fallback tuning.
+sign_slow_delay_s: 2.5
+# Stop sign: keep driving while tag visible; STOP when tag leaves view (see README).
+sign_stop_on_loss: true
+sign_stop_seen_min_frames: 8
+sign_stop_loss_confirm_frames: 2
+sign_stop_rearm_s: 6.0

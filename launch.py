@@ -379,6 +379,13 @@ def package_task(task_name):
                     arc = f'servers/visual_lane_servoing/{rel}'
                     print(f"   Adding dependency: {arc}")
                     tar.add(vls_file, arcname=arc, filter=no_pycache)
+            od_dir = os.path.join(PROJECT_ROOT, 'servers', 'object_detection')
+            for rel in ('__init__.py', 'visualization.py'):
+                od_file = os.path.join(od_dir, rel)
+                if os.path.isfile(od_file):
+                    arc = f'servers/object_detection/{rel}'
+                    print(f"   Adding dependency: {arc}")
+                    tar.add(od_file, arcname=arc, filter=no_pycache)
 
     buf.seek(0)
     print("Package created!")

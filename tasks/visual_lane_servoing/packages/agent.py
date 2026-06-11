@@ -13,7 +13,7 @@ _CONFIG_FILE = os.path.normpath(os.path.join(
 ))
 
 _LINE_OFFSET = 160
-_ROI_START   = 0.47
+_ROI_START   = 0.38
 _NUM_SLICES  = 3
 _SLICE_TOL   = 5
 # Small nudge toward lane center (keep symmetric — large white bias caused false right steer).
@@ -79,8 +79,8 @@ class LaneServoingAgent:
         self.p_gain              = cfg.get('p_gain',              0.1)
         self.d_gain              = cfg.get('d_gain',              0.35)
         self.max_steer           = cfg.get('max_steer',           0.4)
-        self.base_speed          = cfg.get('base_speed',          0.2)
-        self.curve_speed         = cfg.get('curve_speed',         0.2)
+        self.base_speed          = cfg.get('base_speed',          0.4)
+        self.curve_speed         = cfg.get('curve_speed',         0.26)
         self.curve_threshold     = cfg.get('curve_threshold',     350)
         self.steering_threshold  = cfg.get('steering_threshold',  0.2)
         self.curve_boost         = cfg.get('curve_boost',         1.3)

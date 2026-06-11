@@ -66,6 +66,8 @@ def test_config_loads():
 
 def test_yolo_leader_distance_signal():
     cfg = {
+        "role": "follower",
+        "leader_yolo_enabled": True,
         "leader_class_id": 1,
         "leader_center_roi": 1.0,
         "leader_min_bbox_area": 100,
@@ -81,6 +83,7 @@ def test_yolo_leader_distance_signal():
 
     class FakeDet:
         model_loaded = True
+        img_size = 640
 
         def detect(self, _rgb):
             return [far, near]
@@ -126,6 +129,155 @@ def test_role_dispatch():
         agent.run_follower = original_follower
 
 
+def test_slow_sign_delay():
+    agent._sign_runtime.update(
+        {
+            "candidate_event": agent.EVENT_NORMAL,
+            "candidate_count": 0,
+            "active_until": 0.0,
+            "slow_confirm_count": 0,
+            "slow_engaged": False,
+            "slow_loss_streak": 0,
+            "slow_pending_until": 0.0,
+            "stop_visible_streak": 0,
+            "stop_armed": False,
+            "stop_loss_streak": 0,
+            "stop_rearm_until": 0.0,
+            "stop_tag_latch_resume": False,
+        }
+    )
+    cfg = {
+        "stop_tag_ids": [20],
+        "slow_tag_ids": [39],
+        "sign_confirm_frames": 2,
+        "sign_cooldown_s": 0.0,
+        "sign_center_roi": 1.0,
+        "sign_stop_on_loss": True,
+        "sign_stop_seen_min_frames": 99,
+        "sign_stop_loss_confirm_frames": 2,
+        "sign_slow_mode": "delay",
+        "sign_slow_delay_s": 2.5,
+    }
+    slow_det = agent._TagDetection(39, (320.0, 240.0))
+    shape = (480, 640)
+
+    for _ in range(2):
+        assert agent.detect_sign_event([slow_det], shape, cfg) == agent.EVENT_NORMAL
+
+    assert agent.detect_sign_event([slow_det], shape, cfg) == agent.EVENT_NORMAL
+    assert float(agent._sign_runtime.get("slow_pending_until", 0.0)) > time.time()
+
+    agent._sign_runtime["slow_pending_until"] = time.time() - 0.01
+    assert agent.detect_sign_event([slow_det], shape, cfg) == agent.EVENT_SLOW_SIGN
+    assert agent._sign_runtime["candidate_event"] == agent.EVENT_SLOW_SIGN
+    print("OK: slow sign waits before triggering")
+
+
+def test_tag_slow_distance_engages():
+    agent.reset_sign_detection_state()
+    cfg = {
+        "stop_tag_ids": [20],
+        "slow_tag_ids": [39],
+        "sign_confirm_frames": 2,
+        "sign_cooldown_s": 2.0,
+        "sign_center_roi": 1.0,
+        "sign_stop_on_loss": True,
+        "sign_stop_seen_min_frames": 99,
+        "sign_stop_loss_confirm_frames": 2,
+        "sign_slow_mode": "distance",
+        "sign_slow_distance_m": 0.40,
+        "sign_slow_loss_confirm_frames": 2,
+    }
+    far = agent._TagDetection(39, (320.0, 240.0), 0.55)
+    near = agent._TagDetection(39, (320.0, 240.0), 0.35)
+    shape = (480, 640)
+
+    assert agent.detect_sign_event([far], shape, cfg) == agent.EVENT_NORMAL
+    assert agent.detect_sign_event([near], shape, cfg) == agent.EVENT_NORMAL
+    assert agent.detect_sign_event([near], shape, cfg) == agent.EVENT_SLOW_SIGN
+    assert agent._sign_runtime.get("slow_engaged") is True
+    # Tag briefly lost: stay in slow until loss confirm frames elapse.
+    assert agent.detect_sign_event([], shape, cfg) == agent.EVENT_SLOW_SIGN
+    assert agent.detect_sign_event([], shape, cfg) == agent.EVENT_NORMAL
+    assert agent._sign_runtime.get("slow_engaged") is False
+    print("OK: slow sign engages by distance and releases after tag loss")
+
+
+def test_tag_slow_candidate_not_stale_normal():
+    agent.reset_sign_detection_state()
+    cfg = {
+        "stop_tag_ids": [20],
+        "slow_tag_ids": [39],
+        "sign_confirm_frames": 1,
+        "sign_cooldown_s": 2.0,
+        "sign_center_roi": 1.0,
+        "sign_stop_on_loss": True,
+        "sign_stop_seen_min_frames": 99,
+        "sign_stop_loss_confirm_frames": 2,
+        "sign_slow_mode": "distance",
+        "sign_slow_distance_m": 0.40,
+        "sign_slow_loss_confirm_frames": 99,
+    }
+    near = agent._TagDetection(39, (320.0, 240.0), 0.30)
+    shape = (480, 640)
+    assert agent.detect_sign_event([near], shape, cfg) == agent.EVENT_SLOW_SIGN
+    assert agent.detect_sign_event([], shape, cfg) == agent.EVENT_SLOW_SIGN
+    assert agent._sign_runtime["candidate_event"] == agent.EVENT_SLOW_SIGN
+    print("OK: engaged slow keeps EVENT_SLOW_SIGN during cooldown")
+
+
+def test_stop_sign_on_loss():
+    agent._sign_runtime.update(
+        {
+            "candidate_event": agent.EVENT_NORMAL,
+            "candidate_count": 0,
+            "active_until": 0.0,
+            "stop_visible_streak": 0,
+            "stop_armed": False,
+            "stop_loss_streak": 0,
+            "stop_rearm_until": 0.0,
+            "stop_tag_latch_resume": False,
+        }
+    )
+    cfg = {
+        "stop_tag_ids": [20],
+        "slow_tag_ids": [39],
+        "sign_confirm_frames": 3,
+        "sign_cooldown_s": 0.0,
+        "sign_center_roi": 1.0,
+        "sign_stop_on_loss": True,
+        "sign_stop_seen_min_frames": 3,
+        "sign_stop_loss_confirm_frames": 2,
+        "sign_stop_rearm_s": 1.0,
+    }
+    stop_det = agent._TagDetection(20, (320.0, 240.0))
+    shape = (480, 640)
+
+    for _ in range(3):
+        ev = agent.detect_sign_event([stop_det], shape, cfg)
+        assert ev == agent.EVENT_NORMAL, "Stop tag visible should not stop yet"
+
+    ev = agent.detect_sign_event([], shape, cfg)
+    assert ev == agent.EVENT_NORMAL, "One loss frame should not stop yet"
+
+    ev = agent.detect_sign_event([], shape, cfg)
+    assert ev == agent.EVENT_STOP_SIGN, "Stop should trigger after tag leaves view"
+    assert agent._sign_runtime.get("stop_tag_latch_resume") is True
+    print("OK: stop sign triggers on tag loss")
+
+
+def test_sign_state_cleared_on_pause():
+    agent._sign_runtime["slow_engaged"] = True
+    agent._sign_runtime["slow_confirm_count"] = 5
+    agent._sign_runtime["stop_armed"] = True
+    agent.set_driving_enabled(True)
+    agent.set_driving_enabled(False)
+    assert agent._sign_runtime.get("slow_engaged") is False
+    assert int(agent._sign_runtime.get("slow_confirm_count", 0)) == 0
+    assert agent._sign_runtime.get("stop_armed") is False
+    print("OK: sign detection state cleared on pause/stop")
+
+
 def test_loops_exit_cleanly():
     _run_and_stop(agent.run_leader)
     _run_and_stop(agent.run_follower)
@@ -137,6 +289,11 @@ if __name__ == "__main__":
     test_smooth_stop()
     test_config_loads()
     test_yolo_leader_distance_signal()
+    test_slow_sign_delay()
+    test_tag_slow_distance_engages()
+    test_tag_slow_candidate_not_stale_normal()
+    test_stop_sign_on_loss()
+    test_sign_state_cleared_on_pause()
     test_role_dispatch()
     test_loops_exit_cleanly()
     print("All sanity checks passed.")
