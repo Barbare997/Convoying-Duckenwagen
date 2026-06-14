@@ -278,6 +278,57 @@ def test_sign_state_cleared_on_pause():
     print("OK: sign detection state cleared on pause/stop")
 
 
+def test_follower_visual_target_speed():
+    cfg = {"follower_spacing_mode": "visual"}
+    assert agent._follower_spacing_mode(cfg) == agent.FOLLOWER_SPACING_VISUAL
+    assert agent._follower_uses_http_convoy(cfg) is False
+    no_truck = agent._follower_visual_target_speed(
+        cfg,
+        cruise_speed=0.4,
+        follower_max_speed=0.4,
+        follower_min_speed=0.0,
+        distance_signal=None,
+        distance_target=0.05,
+        distance_kp=0.6,
+    )
+    assert abs(no_truck - 0.4) < 1e-6
+    with_truck = agent._follower_visual_target_speed(
+        cfg,
+        cruise_speed=0.4,
+        follower_max_speed=0.4,
+        follower_min_speed=0.0,
+        distance_signal=0.12,
+        distance_target=0.05,
+        distance_kp=0.6,
+    )
+    assert with_truck < no_truck
+    print("OK: follower visual mode speed (lane without truck)")
+
+
+def test_follower_http_link_ui():
+    cfg = {"leader_timeout_s": 2.0, "leader_fallback_max_s": 3.0, "leader_fallback_enabled": False}
+    assert agent._follower_http_link_phase(agent.STATE_CRUISING) == agent.HTTP_LINK_NORMAL
+    assert agent._follower_http_link_phase(agent.FALLBACK_LANE) == agent.HTTP_LINK_FALLBACK
+    assert agent._follower_http_link_phase(agent.EVENT_TIMEOUT) == agent.HTTP_LINK_TIMEOUT
+    assert agent._follower_http_link_phase(agent.STATE_CRUISING, http_latched=True) == agent.HTTP_LINK_TIMEOUT
+    agent._publish_follower_status(
+        mode=agent.FALLBACK_LANE,
+        target_speed=0.12,
+        commanded_speed=0.10,
+        leader_state=agent.STATE_CRUISING,
+        leader_speed=0.40,
+        status_age=2.5,
+        is_stale=True,
+        distance_signal=0.04,
+        cfg={**cfg, "leader_fallback_enabled": True},
+    )
+    st = agent.get_leader_status()
+    assert st.get("follower_mode") == agent.FALLBACK_LANE
+    assert st.get("http_link") == agent.HTTP_LINK_FALLBACK
+    assert "2.0" in str(st.get("http_link_label", ""))
+    print("OK: follower HTTP link status for UI")
+
+
 def test_loops_exit_cleanly():
     _run_and_stop(agent.run_leader)
     _run_and_stop(agent.run_follower)
@@ -295,5 +346,7 @@ if __name__ == "__main__":
     test_stop_sign_on_loss()
     test_sign_state_cleared_on_pause()
     test_role_dispatch()
+    test_follower_visual_target_speed()
+    test_follower_http_link_ui()
     test_loops_exit_cleanly()
     print("All sanity checks passed.")

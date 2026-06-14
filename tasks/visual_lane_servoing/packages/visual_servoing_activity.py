@@ -18,9 +18,9 @@ _white_lower = np.array([_h.get('white_lower_h', 0),   _h.get('white_lower_s', 0
 _white_upper = np.array([_h.get('white_upper_h', 0), _h.get('white_upper_s', 0), _h.get('white_upper_v', 0)])
 
 def detect_lane_markings(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # 1) Ignore only the sky band; keep upper lane visible for intersections (lower 80%).
+    # 1) Ignore sky + distant band; keep near lane for steering (lower 75%).
     h, w = image.shape[:2]
-    crop_top = int(h * 0.20)
+    crop_top = int(h * 0.25)
     roi = image[crop_top:, :]
 
     # 2) Blur to reduce high-frequency noise before color thresholding.

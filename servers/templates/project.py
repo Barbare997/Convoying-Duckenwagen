@@ -23,6 +23,10 @@ _EXTRA_CSS = HSV_EXTRA_CSS + '''
 #statusTable .row:last-child { border-bottom: none; }
 #statusTable .key  { color: var(--text-secondary); font-size: 12px; }
 #statusTable .val  { color: var(--text-primary); font-weight: 500; font-size: 13px; font-family: monospace; }
+#statusTable .val.link-normal  { color: var(--accent-green, #2ecc71); }
+#statusTable .val.link-visual  { color: #5dade2; }
+#statusTable .val.link-fallback { color: var(--accent-orange, #e67e22); }
+#statusTable .val.link-timeout  { color: #e74c3c; }
 .convoy-btn-active { outline: 2px solid var(--accent-green, #2ecc71); outline-offset: 2px; }
 #yoloStatusLine { font-size: 13px; line-height: 1.5; }
 #yoloStatusLine .ok   { color: var(--accent-green, #2ecc71); font-weight: 600; }
@@ -239,31 +243,54 @@ _JS = HSV_EXTRA_JS + '''
         .catch(() => showStatus('config-status', 'Update Failed!', 'error'));
     }
 
+    function linkPhaseClass(phase) {
+        if (phase === 'visual') return 'link-visual';
+        if (phase === 'fallback') return 'link-fallback';
+        if (phase === 'timeout') return 'link-timeout';
+        return 'link-normal';
+    }
+
     function refreshConvoyStatus() {
         fetch('/status')
             .then(r => r.json())
             .then(data => {
                 updateRolePanels(data);
-                const rows = [
-                    ['role', data.role],
-                    ['state', data.state],
-                    ['speed', data.speed != null ? Number(data.speed).toFixed(2) : '-'],
-                    ['event', data.event || '-'],
-                    ['manual', data.manual_command || '-'],
-                ];
-                if (data.role === 'leader') {
+                const role = (data.role || 'leader').toLowerCase();
+                const rows = [];
+                if (role === 'follower') {
+                    rows.push(['spacing_mode', data.follower_spacing_mode || 'http']);
+                    rows.push(['follower_mode', data.follower_mode || data.state || '-']);
+                    rows.push(['http_link', data.http_link_label || data.http_link || '-']);
+                    rows.push(['http_age_s', data.http_age_s != null ? Number(data.http_age_s).toFixed(2) : '-']);
+                    rows.push(['target_speed', data.target_speed != null ? Number(data.target_speed).toFixed(2) : '-']);
+                    rows.push(['cmd_speed', data.speed != null ? Number(data.speed).toFixed(2) : '-']);
+                    rows.push(['yolo_signal', data.distance_signal != null ? Number(data.distance_signal).toFixed(3) : '-']);
+                } else {
+                    rows.push(['role', data.role]);
+                    rows.push(['state', data.state]);
+                    rows.push(['speed', data.speed != null ? Number(data.speed).toFixed(2) : '-']);
+                    rows.push(['event', data.event || '-']);
+                    rows.push(['manual', data.manual_command || '-']);
+                }
+                if (role === 'leader') {
                     rows.push(['sign_source', data.sign_source || '-']);
                     rows.push(['apriltag', data.apriltag_available ? 'yes' : 'no']);
                     rows.push(['tags', (data.tag_ids && data.tag_ids.length) ? data.tag_ids.join(', ') : '-']);
                 }
-                if (data.role === 'follower' && data.leader) {
+                if (role === 'follower' && data.leader) {
                     rows.push(['leader_state', data.leader.state || '-']);
                     rows.push(['leader_speed', data.leader.speed != null ? Number(data.leader.speed).toFixed(2) : '-']);
+                    const leaderDrv = data.leader.driving_enabled;
+                    rows.push([
+                        'leader_drive',
+                        leaderDrv === true ? 'RUNNING' : (leaderDrv === false ? 'PAUSED' : '-'),
+                    ]);
                     rows.push(['leader_cmd', data.leader.manual_command || '-']);
                 }
-                document.getElementById('statusTable').innerHTML = rows.map(([k, v]) =>
-                    `<div class="row"><span class="key">${k}</span><span class="val">${v}</span></div>`
-                ).join('');
+                document.getElementById('statusTable').innerHTML = rows.map(([k, v]) => {
+                    const cls = k === 'http_link' ? linkPhaseClass(data.http_link) : '';
+                    return `<div class="row"><span class="key">${k}</span><span class="val ${cls}">${v}</span></div>`;
+                }).join('');
                 document.getElementById('statusDot').style.background = 'var(--accent-green)';
             })
             .catch(() => {

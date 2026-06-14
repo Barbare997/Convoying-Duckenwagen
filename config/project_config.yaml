@@ -1,7 +1,13 @@
-role: follower
-leader_host: kvati.local
+role: leader
+leader_host: 172.20.10.5
 # Must match leader project server port (real_server default 5000)
 leader_port: 5055
+
+# Follower convoy link: http = follow leader over Wi‑Fi (signs + speed).
+# visual = lane follow always + YOLO spacing when truck seen (no HTTP timeouts/stops).
+follower_spacing_mode: visual
+# Optional: poll leader HTTP for UI mirror only (does not affect driving in visual mode).
+follower_http_mirror: false
 
 
 # Sign input: both = UI buttons + AprilTags (buttons win when Slow/Stop latched)
@@ -12,7 +18,7 @@ sign_source: both
 # Follower always scales lane PWM to cruise_speed / leader status / YOLO.
 lane_use_direct_pwm: true
 cruise_speed: 0.40
-slow_speed: 0.15
+slow_speed: 0.20
 
 follower_max_speed: 0.40
 follower_min_speed: 0.0
@@ -20,15 +26,28 @@ follower_min_speed: 0.0
 distance_target: 0.05
 #error = distance_target - distance_signal, target_speed += distance_kp * error
 distance_kp: 0.6
-#If follower’s last successful leader status is older than 0.4 seconds, treat leader as lost → stop.
-leader_timeout_s: 0.4
+# HTTP older than this is "stale". Until hard stop (below), follower may use safe fallback.
+leader_timeout_s: 2.0
+
+# Stale grace: fallback lane from leader_timeout_s up to leader_timeout_s + leader_fallback_max_s.
+# Hard full stop at 2 + 35 = 37 seconds with no fresh leader HTTP.
+leader_fallback_enabled: true
+leader_fallback_max_s: 35.0
+leader_fallback_speed: 0.20
+leader_fallback_require_truck: true
+
+# YOLO/TRT only after follower Start — keeps camera stable at boot (~1 min compile while stopped).
+leader_yolo_defer_until_start: true
+
+# After HTTP timeout while driving: stay stopped until Pause (clears latch), then Start again.
+follower_latch_http_timeout: true
 
 #leader updates its status every status_publish_hz times per second
 status_publish_hz: 10
 #follower asks leader's status every status_poll_hz times per second
 status_poll_hz: 10
-#Each HTTP request to leader waits max 0.2 s before giving up that poll.
-request_timeout_s: 0.2
+# Each HTTP request to leader waits at most this long before that poll is skipped.
+request_timeout_s: 0.5
 stop_hold_s: 2.0
 # Slow button: stay in SLOW this long, then auto-resume to CRUISING (follower follows via HTTP)
 slow_hold_s: 4.0

@@ -20,6 +20,13 @@ STATE_CRUISING = "CRUISING"
 STATE_SLOW = "SLOW"
 STATE_STOPPING = "STOPPING"
 STATE_STOPPED = "STOPPED"
+# Follower only: HTTP stale but inside safe grace — lane follow at capped speed, YOLO brake-only.
+FALLBACK_LANE = "FALLBACK_LANE"
+
+# Follower spacing: http = leader Wi‑Fi convoy; visual = lane + YOLO only (no HTTP control).
+FOLLOWER_SPACING_HTTP = "http"
+FOLLOWER_SPACING_VISUAL = "visual"
+HTTP_LINK_VISUAL = "visual"
 
 # Events
 EVENT_NORMAL = "EVENT_NORMAL"
@@ -82,6 +89,12 @@ _manual_convoy_cmd = MANUAL_CRUISING
 _manual_lock = threading.Lock()
 _manual_slow_until = 0.0
 _follower_leader_mirror: Dict[str, Any] = {}
+_follower_http_latched = False
+
+# Follower UI /status: updated by run_follower (not used on leader).
+HTTP_LINK_NORMAL = "normal"
+HTTP_LINK_FALLBACK = "fallback"
+HTTP_LINK_TIMEOUT = "timeout"
 
 # YOLO class id for leader Duckiebot (trained as "truck" in object_detection task).
 LEADER_YOLO_CLASS_ID = 1
@@ -109,6 +122,14 @@ def load_config() -> Dict[str, Any]:
         "status_poll_hz": float(cfg.get("status_poll_hz", 10)),
         "request_timeout_s": float(cfg.get("request_timeout_s", 0.2)),
         "leader_timeout_s": float(cfg.get("leader_timeout_s", 0.4)),
+        "leader_fallback_enabled": bool(cfg.get("leader_fallback_enabled", False)),
+        "leader_fallback_max_s": float(cfg.get("leader_fallback_max_s", 3.0)),
+        "leader_fallback_speed": float(cfg.get("leader_fallback_speed", 0.20)),
+        "leader_fallback_require_truck": bool(cfg.get("leader_fallback_require_truck", True)),
+        "leader_yolo_defer_until_start": bool(cfg.get("leader_yolo_defer_until_start", True)),
+        "follower_latch_http_timeout": bool(cfg.get("follower_latch_http_timeout", True)),
+        "follower_spacing_mode": str(cfg.get("follower_spacing_mode", FOLLOWER_SPACING_HTTP)).strip().lower(),
+        "follower_http_mirror": bool(cfg.get("follower_http_mirror", False)),
         "stop_hold_s": float(cfg.get("stop_hold_s", 2.0)),
         "slow_hold_s": float(cfg.get("slow_hold_s", 4.0)),
         "decel_time_s": float(cfg.get("decel_time_s", 1.2)),
@@ -309,12 +330,220 @@ def get_runtime_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _follower_spacing_mode(cfg: Dict[str, Any]) -> str:
+    mode = str(cfg.get("follower_spacing_mode", FOLLOWER_SPACING_HTTP)).strip().lower()
+    if mode in (FOLLOWER_SPACING_VISUAL, "lane_yolo", "lane"):
+        return FOLLOWER_SPACING_VISUAL
+    return FOLLOWER_SPACING_HTTP
+
+
+def _follower_uses_http_convoy(cfg: Dict[str, Any]) -> bool:
+    return _follower_spacing_mode(cfg) == FOLLOWER_SPACING_HTTP
+
+
+def _follower_visual_target_speed(
+    cfg: Dict[str, Any],
+    *,
+    cruise_speed: float,
+    follower_max_speed: float,
+    follower_min_speed: float,
+    distance_signal: Optional[float],
+    distance_target: float,
+    distance_kp: float,
+) -> float:
+    """Lane + optional YOLO spacing; cruise when no truck in view."""
+    target = min(cruise_speed, follower_max_speed)
+    if distance_signal is not None:
+        distance_error = distance_target - float(distance_signal)
+        target += distance_kp * distance_error
+        target = max(follower_min_speed, min(follower_max_speed, target))
+    return target
+
+
+def _resolve_follower_http_mode(
+    *,
+    cfg: Dict[str, Any],
+    is_stale: bool,
+    status_age: float,
+    state: str,
+    leader_speed: float,
+    distance_signal: Optional[float],
+    leader_timeout_s: float,
+    fallback_max_s: float,
+    fallback_enabled: bool,
+    latch_timeout: bool,
+    cruise_speed: float,
+    slow_speed: float,
+    follower_max_speed: float,
+    distance_target: float,
+    distance_kp: float,
+) -> Tuple[str, float]:
+    hard_stop_age = leader_timeout_s + max(0.0, fallback_max_s)
+
+    if (
+        latch_timeout
+        and _is_follower_http_latched()
+        and is_driving_enabled()
+    ):
+        return EVENT_TIMEOUT, 0.0
+    if is_stale and status_age > hard_stop_age:
+        if latch_timeout and is_driving_enabled():
+            _set_follower_http_latch()
+        return EVENT_TIMEOUT, 0.0
+    if is_stale and state in (STATE_STOPPED, STATE_STOPPING):
+        return STATE_STOPPED, 0.0
+    if (
+        is_stale
+        and fallback_enabled
+        and state in (STATE_CRUISING, STATE_SLOW)
+    ):
+        require_truck = bool(cfg.get("leader_fallback_require_truck", True))
+        if require_truck and distance_signal is None:
+            return EVENT_TIMEOUT, 0.0
+        return (
+            FALLBACK_LANE,
+            _follower_fallback_target_speed(
+                cfg,
+                slow_speed=slow_speed,
+                last_leader_speed=leader_speed,
+                distance_signal=distance_signal,
+                distance_target=distance_target,
+                distance_kp=distance_kp,
+            ),
+        )
+    if is_stale:
+        if latch_timeout and is_driving_enabled():
+            _set_follower_http_latch()
+        return EVENT_TIMEOUT, 0.0
+    if state == STATE_STOPPED:
+        return STATE_STOPPED, 0.0
+    if state == STATE_SLOW:
+        return STATE_SLOW, min(slow_speed, leader_speed, follower_max_speed)
+    target = min(cruise_speed, leader_speed, follower_max_speed)
+    return STATE_CRUISING, target
+
+
 def _update_follower_leader_mirror(payload: Dict[str, Any]) -> None:
     global _follower_leader_mirror
     with _status_lock:
         _follower_leader_mirror = dict(payload)
- 
- 
+
+
+def _clear_follower_http_latch() -> None:
+    global _follower_http_latched
+    with _status_lock:
+        _follower_http_latched = False
+
+
+def _set_follower_http_latch() -> None:
+    global _follower_http_latched
+    with _status_lock:
+        _follower_http_latched = True
+
+
+def _is_follower_http_latched() -> bool:
+    with _status_lock:
+        return bool(_follower_http_latched)
+
+
+def _yolo_should_run(cfg: Dict[str, Any]) -> bool:
+    if not cfg.get("leader_yolo_enabled", True):
+        return False
+    if bool(cfg.get("leader_yolo_defer_until_start", True)):
+        return is_driving_enabled()
+    return True
+
+
+def _maybe_init_detection_agent(cfg: Dict[str, Any]):
+    if _detection_agent is not None and getattr(_detection_agent, "model_loaded", False):
+        return _detection_agent
+    if not _yolo_should_run(cfg):
+        return None
+    return _get_detection_agent()
+
+
+def _follower_http_link_phase(mode: str, *, http_latched: bool = False, spacing_mode: str = FOLLOWER_SPACING_HTTP) -> str:
+    """Map follower drive mode to HTTP link phase for the UI."""
+    if spacing_mode == FOLLOWER_SPACING_VISUAL:
+        return HTTP_LINK_VISUAL
+    if http_latched or str(mode).upper() == EVENT_TIMEOUT:
+        return HTTP_LINK_TIMEOUT
+    mode_u = str(mode).upper()
+    if mode_u == FALLBACK_LANE:
+        return HTTP_LINK_FALLBACK
+    return HTTP_LINK_NORMAL
+
+
+def _follower_http_link_label(
+    phase: str,
+    *,
+    leader_timeout_s: float,
+    fallback_max_s: float,
+    fallback_enabled: bool,
+    http_latched: bool = False,
+    spacing_mode: str = FOLLOWER_SPACING_HTTP,
+) -> str:
+    if spacing_mode == FOLLOWER_SPACING_VISUAL:
+        return "Visual mode — lane follow + YOLO spacing (no leader HTTP)"
+    t0 = max(0.0, float(leader_timeout_s))
+    t1 = t0 + max(0.0, float(fallback_max_s))
+    if http_latched:
+        return "Latched stop — press Pause, then Start to resume"
+    if phase == HTTP_LINK_FALLBACK:
+        return f"Stale HTTP ({t0:.1f}–{t1:.1f}s) — safe lane fallback"
+    if phase == HTTP_LINK_TIMEOUT:
+        if fallback_enabled:
+            return f"Stale HTTP (>{t1:.1f}s) — full stop"
+        return f"Stale HTTP (>{t0:.1f}s) — full stop"
+    return f"HTTP OK (≤{t0:.1f}s) — convoy + YOLO spacing"
+
+
+def _publish_follower_status(
+    *,
+    mode: str,
+    target_speed: float,
+    commanded_speed: float,
+    leader_state: str,
+    leader_speed: float,
+    status_age: float,
+    is_stale: bool,
+    distance_signal: Optional[float],
+    cfg: Dict[str, Any],
+) -> None:
+    leader_timeout_s = float(cfg.get("leader_timeout_s", 0.4))
+    fallback_max_s = float(cfg.get("leader_fallback_max_s", 3.0))
+    fallback_enabled = bool(cfg.get("leader_fallback_enabled", False))
+    spacing_mode = _follower_spacing_mode(cfg)
+    http_latched = _is_follower_http_latched()
+    phase = _follower_http_link_phase(mode, http_latched=http_latched, spacing_mode=spacing_mode)
+    payload = build_status_payload(str(mode).upper(), float(commanded_speed))
+    payload.update(
+        {
+            "event": EVENT_NORMAL,
+            "follower_mode": str(mode).upper(),
+            "follower_spacing_mode": spacing_mode,
+            "target_speed": float(target_speed),
+            "http_age_s": round(float(status_age), 2),
+            "http_stale": bool(is_stale),
+            "http_latched": http_latched,
+            "http_link": phase,
+            "http_link_label": _follower_http_link_label(
+                phase,
+                leader_timeout_s=leader_timeout_s,
+                fallback_max_s=fallback_max_s,
+                fallback_enabled=fallback_enabled,
+                http_latched=http_latched,
+                spacing_mode=spacing_mode,
+            ),
+            "leader_state_cached": str(leader_state).upper(),
+            "leader_speed_cached": float(leader_speed),
+            "distance_signal": float(distance_signal) if distance_signal is not None else None,
+            "role_hint": "follower",
+        }
+    )
+    set_leader_status(payload)
+
+
 def build_status_payload(state: str, speed: float) -> Dict[str, Any]:
     """Create the canonical leader status payload shared by leader/follower code."""
     return {
@@ -1315,7 +1544,10 @@ def fetch_yolo_detections(frame_bgr, cfg: Dict[str, Any]) -> list:
     if not cfg.get("leader_yolo_enabled", True):
         return []
 
-    _get_detection_agent()
+    if not _yolo_should_run(cfg) and _detection_agent is None:
+        return []
+
+    _maybe_init_detection_agent(cfg)
 
     min_dt = 1.0 / max(1.0, float(cfg.get("status_poll_hz", 10)))
     now = time.time()
@@ -1323,14 +1555,15 @@ def fetch_yolo_detections(frame_bgr, cfg: Dict[str, Any]) -> list:
         if now - _yolo_detect_cache_ts < min_dt:
             return list(_yolo_detect_cache_dets)
 
-        det_agent = _get_detection_agent()
+        det_agent = _maybe_init_detection_agent(cfg)
         if det_agent is None or not det_agent.model_loaded:
             return list(_yolo_detect_cache_dets)
 
         _log_yolo_ready_if_needed(det_agent)
         try:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            detections = list(det_agent.detect(frame_rgb))
+            raw = det_agent.detect(frame_rgb)
+            detections = list(raw) if raw is not None else []
             _yolo_detect_cache_dets = detections
             _yolo_detect_cache_ts = time.time()
             return detections
@@ -1395,6 +1628,8 @@ def set_driving_enabled(enabled: bool) -> None:
     with _driving_lock:
         was_enabled = _driving_enabled
         _driving_enabled = bool(enabled)
+    if was_enabled and not bool(enabled):
+        _clear_follower_http_latch()
     if was_enabled != bool(enabled):
         reset_sign_detection_state()
 
@@ -1457,6 +1692,31 @@ def _sleep_if_no_frame(frame_bgr) -> None:
     """Match visual_lane_servoing: run per camera frame, brief wait only when no frame."""
     if frame_bgr is None:
         time.sleep(0.01)
+
+
+def _follower_fallback_target_speed(
+    cfg: Dict[str, Any],
+    *,
+    slow_speed: float,
+    last_leader_speed: float,
+    distance_signal: Optional[float],
+    distance_target: float,
+    distance_kp: float,
+) -> float:
+    """Safe degraded speed: cap low, never speed up toward truck — brake only if too close."""
+    cap = min(
+        float(cfg.get("leader_fallback_speed", slow_speed)),
+        slow_speed,
+        last_leader_speed if last_leader_speed > 0.0 else slow_speed,
+        float(cfg.get("follower_max_speed", 0.4)),
+    )
+    cap = max(0.0, cap)
+    if distance_signal is None:
+        return cap
+    # Too close (larger signal): slow down; never add speed when leader is closer than target.
+    if float(distance_signal) > distance_target:
+        cap = max(0.0, cap - distance_kp * (float(distance_signal) - distance_target))
+    return cap
 
 
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
@@ -1603,13 +1863,17 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 _safe_stop(wheels)
 
         if now - last_status_pub >= status_dt:
-            payload = build_status_payload(state, current_speed)
+            driving = is_driving_enabled()
+            # Pause stops wheels locally; HTTP must report speed 0 so follower does not cruise.
+            reported_speed = float(current_speed) if driving else 0.0
+            payload = build_status_payload(state, reported_speed)
             payload.update(
                 {
                     "event": last_event,
                     "tag_ids": last_tag_ids,
                     "manual_command": get_manual_convoy_command(),
                     "sign_source": sign_source,
+                    "driving_enabled": driving,
                 }
             )
             set_leader_status(payload)
@@ -1654,12 +1918,27 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     decel_time_s = float(cfg.get("decel_time_s", 1.2))
     decel_steps = int(cfg.get("decel_steps", 10))
     status_url = f"http://{leader_host}:{leader_port}/convoy/status"
+    spacing_mode = _follower_spacing_mode(cfg)
+    use_http = spacing_mode == FOLLOWER_SPACING_HTTP
+    http_mirror = bool(cfg.get("follower_http_mirror", False))
     print("[Project][Follower] Lane control: one update per camera frame (like visual_lane_servoing).")
-    print(f"[Project][Follower] HTTP + YOLO spacing polled at {poll_hz:.1f} Hz.")
+    if use_http:
+        print(f"[Project][Follower] Convoy: leader HTTP + YOLO polled at {poll_hz:.1f} Hz.")
+    else:
+        print(
+            "[Project][Follower] Convoy: VISUAL mode — lane follow always; "
+            "YOLO adjusts speed when truck seen (no HTTP timeouts).",
+            flush=True,
+        )
+        if http_mirror:
+            print("[Project][Follower] Optional leader HTTP mirror enabled (UI only).", flush=True)
  
+    status_hz = max(1.0, float(cfg.get("status_publish_hz", 10)))
+    status_dt = 1.0 / status_hz
     last_log = 0.0
     last_poll = 0.0
     last_yolo = 0.0
+    last_status_pub = 0.0
     last_drive_ts = time.time()
     latest = build_status_payload(STATE_STOPPED, 0.0)
     mode = EVENT_TIMEOUT
@@ -1668,11 +1947,38 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     prev_mode = None
     last_distance_signal = None
     last_distance_meta = None
+    fallback_enabled = bool(cfg.get("leader_fallback_enabled", False))
+    latch_timeout = bool(cfg.get("follower_latch_http_timeout", True))
+    fallback_max_s = float(cfg.get("leader_fallback_max_s", 3.0))
     if bool(cfg.get("leader_yolo_enabled", True)):
-        print("[Project][Follower] Leader spacing: HTTP + YOLO truck.", flush=True)
-        _get_detection_agent()
+        if bool(cfg.get("leader_yolo_defer_until_start", True)):
+            print(
+                "[Project][Follower] YOLO loads on Start (camera stable first; ~1 min TRT compile).",
+                flush=True,
+            )
+        else:
+            print("[Project][Follower] YOLO truck spacing enabled.", flush=True)
+            _get_detection_agent()
     else:
-        print("[Project][Follower] Leader spacing: HTTP only.", flush=True)
+        print("[Project][Follower] YOLO spacing disabled.", flush=True)
+    if use_http and fallback_enabled:
+        print(
+            f"[Project][Follower] Safe HTTP fallback: up to {fallback_max_s:.1f}s lane @ "
+            f"{float(cfg.get('leader_fallback_speed', slow_speed)):.2f} after "
+            f"{leader_timeout_s:.1f}s stale (truck required, brake-only YOLO).",
+            flush=True,
+        )
+    elif use_http and latch_timeout:
+        print(
+            f"[Project][Follower] Bad-hardware mode: stale HTTP >{leader_timeout_s:.1f}s -> "
+            "full stop (latched until Pause). No lane fallback.",
+            flush=True,
+        )
+    elif use_http:
+        print(
+            f"[Project][Follower] Stale HTTP >{leader_timeout_s:.1f}s -> full stop (no fallback).",
+            flush=True,
+        )
 
     while not stop_event.is_set():
         now = time.time()
@@ -1690,7 +1996,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 last_distance_meta = distance_meta
             last_yolo = now
 
-        if now - last_poll >= poll_dt:
+        if use_http and (now - last_poll >= poll_dt):
             try:
                 resp = requests.get(status_url, timeout=request_timeout_s)
                 if resp.ok:
@@ -1701,25 +2007,72 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                         "ts": float(data.get("ts", 0.0)),
                         "event": str(data.get("event", EVENT_NORMAL)),
                         "manual_command": str(data.get("manual_command", MANUAL_CRUISING)),
+                        "driving_enabled": bool(data.get("driving_enabled", True)),
                     }
                     _update_follower_leader_mirror(latest)
             except Exception:
                 pass
             last_poll = now
+        elif http_mirror and (now - last_poll >= poll_dt):
+            try:
+                resp = requests.get(status_url, timeout=request_timeout_s)
+                if resp.ok:
+                    data = resp.json()
+                    _update_follower_leader_mirror(
+                        {
+                            "state": str(data.get("state", "STOPPED")).upper(),
+                            "speed": float(data.get("speed", 0.0)),
+                            "ts": float(data.get("ts", 0.0)),
+                            "event": str(data.get("event", EVENT_NORMAL)),
+                            "manual_command": str(data.get("manual_command", MANUAL_CRUISING)),
+                            "driving_enabled": bool(data.get("driving_enabled", True)),
+                        }
+                    )
+            except Exception:
+                pass
+            last_poll = now
  
-        is_stale = (now - float(latest.get("ts", 0.0))) > leader_timeout_s
+        status_age = now - float(latest.get("ts", 0.0))
+        is_stale = status_age > leader_timeout_s
         state = str(latest.get("state", "STOPPED")).upper()
         leader_speed = max(0.0, float(latest.get("speed", 0.0)))
-        if is_stale:
-            mode, target_speed = EVENT_TIMEOUT, 0.0
-        elif state == STATE_STOPPED:
-            mode, target_speed = STATE_STOPPED, 0.0
-        elif state == STATE_SLOW:
-            mode, target_speed = STATE_SLOW, min(slow_speed, leader_speed, follower_max_speed)
-        else:
-            mode, target_speed = STATE_CRUISING, min(cruise_speed, leader_speed, follower_max_speed)
 
-        if mode in (STATE_CRUISING, STATE_SLOW) and distance_signal is not None:
+        if not use_http:
+            if not is_driving_enabled():
+                mode, target_speed = STATE_STOPPED, 0.0
+            else:
+                mode = STATE_CRUISING
+                target_speed = _follower_visual_target_speed(
+                    cfg,
+                    cruise_speed=cruise_speed,
+                    follower_max_speed=follower_max_speed,
+                    follower_min_speed=follower_min_speed,
+                    distance_signal=distance_signal,
+                    distance_target=distance_target,
+                    distance_kp=distance_kp,
+                )
+            status_age = 0.0
+            is_stale = False
+        else:
+            mode, target_speed = _resolve_follower_http_mode(
+                cfg=cfg,
+                is_stale=is_stale,
+                status_age=status_age,
+                state=state,
+                leader_speed=leader_speed,
+                distance_signal=distance_signal,
+                leader_timeout_s=leader_timeout_s,
+                fallback_max_s=fallback_max_s,
+                fallback_enabled=fallback_enabled,
+                latch_timeout=latch_timeout,
+                cruise_speed=cruise_speed,
+                slow_speed=slow_speed,
+                follower_max_speed=follower_max_speed,
+                distance_target=distance_target,
+                distance_kp=distance_kp,
+            )
+
+        if use_http and mode in (STATE_CRUISING, STATE_SLOW) and distance_signal is not None:
             # Smaller signal -> leader farther -> speed up; larger -> closer -> slow down.
             distance_error = distance_target - float(distance_signal)
             target_speed += distance_kp * distance_error
@@ -1746,7 +2099,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 _safe_stop(wheels)
             commanded_speed = 0.0
             _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
-        else:
+        elif mode in (STATE_CRUISING, STATE_SLOW, FALLBACK_LANE):
             commanded_speed = _ramp_toward(
                 commanded_speed,
                 target_speed,
@@ -1763,23 +2116,43 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 wheels.set_wheels_speed(commanded_speed, commanded_speed)
             elif wheels is not None:
                 _safe_stop(wheels)
+        else:
+            commanded_speed = 0.0
+            _safe_stop(wheels)
+            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
 
         if mode != prev_mode:
             print(f"[Project][Follower] transition {prev_mode} -> {mode}")
             prev_mode = mode
 
+        if now - last_status_pub >= status_dt:
+            _publish_follower_status(
+                mode=mode,
+                target_speed=target_speed,
+                commanded_speed=commanded_speed,
+                leader_state=state,
+                leader_speed=leader_speed,
+                status_age=status_age,
+                is_stale=is_stale,
+                distance_signal=distance_signal,
+                cfg=cfg,
+            )
+            last_status_pub = now
+
         if now - last_log >= 2.0:
-            age = now - float(latest.get("ts", 0.0))
             print(
                 f"[Project][Follower] mode={mode} target_speed={target_speed:.2f} cmd={commanded_speed:.2f} "
-                f"leader_state={state} leader_speed={leader_speed:.2f} age={age:.2f}s "
+                f"leader_state={state} leader_speed={leader_speed:.2f} age={status_age:.2f}s "
                 f"dist_signal={distance_signal} dist_meta={last_distance_meta}"
             )
             last_log = now
 
+        led_state = mode
+        if mode in (EVENT_TIMEOUT, FALLBACK_LANE):
+            led_state = STATE_SLOW if mode == FALLBACK_LANE else STATE_STOPPED
         _apply_convoy_leds(
             leds,
-            state=mode if mode != EVENT_TIMEOUT else STATE_STOPPED,
+            state=led_state,
             current_speed=commanded_speed,
             cruise_speed=cruise_speed,
             slow_speed=slow_speed,
@@ -1787,6 +2160,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         )
         _sleep_if_no_frame(frame_bgr)
  
+    set_leader_status(build_status_payload(STATE_STOPPED, 0.0))
     _safe_stop(wheels)
     _convoy_leds_off(leds)
     print("[Project][Follower] Stopped.")
