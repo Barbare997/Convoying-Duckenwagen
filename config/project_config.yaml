@@ -9,11 +9,8 @@ sign_source: both
 
 
 # Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
-
-# Follower scales lane PWM to cruise_speed + circle-grid spacing when leader visible.
-# When leader grid is lost, follower falls back to lane-only follow (direct PWM if true).
-
-lane_use_direct_pwm: true
+# Follower always scales lane PWM to spacing/commanded speed (keep false on follower bot).
+lane_use_direct_pwm: false
 
 cruise_speed: 0.40
 
@@ -21,7 +18,11 @@ slow_speed: 0.15
 
 
 
-follower_max_speed: 0.48
+follower_max_speed: 0.46
+follower_require_leader: true
+follower_spacing_warmup_frames: 8
+follower_catchup_margin: 0.06
+follower_lane_fallback_speed: 0.15
 
 follower_min_speed: 0.0
 
@@ -68,11 +69,11 @@ intersection_heading_sign: -1.0
 intersection_heading_weak_scale: 0.55
 # Turn/recovery speeds (~slow_speed); outer/inner ratio sets differential arc
 intersection_turn_speed: 0.15
-# Left/right: lane-follow on red line this long before differential arc starts.
-intersection_turn_delay_s: 2.0
-intersection_turn_wait_speed: 0.12
-intersection_turn_inner_ratio: 0.27
-intersection_turn_outer_ratio: 1.0
+# Left/right: hold still on the red line this long before differential arc.
+intersection_turn_delay_s: 0.8
+intersection_turn_wait_speed: 0.0
+intersection_turn_inner_ratio: 0.4
+intersection_turn_outer_ratio: 0.7
 # Straight intersection: follow white lane edge (not blind equal PWM / robot heading).
 intersection_straight_use_lane: true
 intersection_straight_min_white_px: 200

@@ -452,6 +452,74 @@ def test_sign_state_cleared_on_pause():
     print("OK: sign detection state cleared on pause/stop")
 
 
+def test_follower_cruise_target_speed_startup():
+    from tasks.project.packages.agent import _follower_cruise_target_speed
+    from tasks.project.packages.follower_spacing import GridSpacingController
+
+    cfg = {
+        "slow_speed": 0.15,
+        "span_target_px": 28.0,
+        "spacing_kp": 0.012,
+        "spacing_kd": 0.022,
+        "follower_require_leader": True,
+        "follower_spacing_warmup_frames": 8,
+        "follower_catchup_margin": 0.06,
+        "follower_lane_fallback_speed": 0.15,
+        "span_too_close_px": 44.0,
+        "span_too_close_speed": 0.06,
+    }
+    spacing = GridSpacingController()
+
+    blind = _follower_cruise_target_speed(
+        spacing, cfg, 0.0, 0.48, 0.4, 0.15, False, 0, None,
+    )
+    assert blind == 0.0, "no leader grid -> hold still"
+
+    spacing.observe(18.0, 0.0, cfg, 0.0)
+    early = _follower_cruise_target_speed(
+        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 2, 18.0,
+    )
+    assert early <= 0.15, "warmup should not sprint before spacing settles"
+
+    for i in range(10):
+        spacing.observe(18.0, 0.2 + i * 0.1, cfg, 0.15)
+    chase = _follower_cruise_target_speed(
+        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 10, 18.0,
+    )
+    assert chase <= 0.46 + 1e-6, "convoy should not outrun leader cruise by much"
+
+    close = _follower_cruise_target_speed(
+        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 10, 45.0,
+    )
+    assert close <= 0.06 + 1e-6, "too-close span should crawl or stop"
+    print("OK: follower cruise speed is conservative at startup")
+
+
+def test_intersection_arc_pwm_not_scaled_by_cruise():
+    from tasks.project.packages.agent import _apply_lane_wheels
+    from tasks.project.packages.intersection_follow import intersection_wheel_commands
+
+    class _Wheels:
+        def __init__(self):
+            self.left = self.right = 0.0
+
+        def set_wheels_speed(self, left, right):
+            self.left = float(left)
+            self.right = float(right)
+
+    cfg = {
+        "intersection_turn_speed": 0.15,
+        "intersection_turn_inner_ratio": 0.27,
+        "intersection_turn_outer_ratio": 1.0,
+    }
+    expected = intersection_wheel_commands("right", cfg)
+    wheels = _Wheels()
+    _apply_lane_wheels(wheels, expected[0], expected[1], 0.48, True)
+    assert abs(wheels.left - expected[0]) < 1e-6
+    assert abs(wheels.right - expected[1]) < 1e-6
+    print("OK: intersection arc PWM is direct, not cruise-scaled")
+
+
 def test_loops_exit_cleanly():
     _run_and_stop(agent.run_leader)
     _run_and_stop(agent.run_follower)
@@ -469,6 +537,8 @@ if __name__ == "__main__":
     test_intersection_straight_lane_pwm()
     test_lane_ignore_red_for_convoy()
     test_leader_turn_tracker()
+    test_follower_cruise_target_speed_startup()
+    test_intersection_arc_pwm_not_scaled_by_cruise()
     test_slow_sign_delay()
     test_tag_slow_distance_engages()
     test_tag_slow_candidate_not_stale_normal()

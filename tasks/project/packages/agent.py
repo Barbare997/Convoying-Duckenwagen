@@ -101,6 +101,10 @@ def load_config() -> Dict[str, Any]:
         "slow_speed": float(cfg.get("slow_speed", 0.15)),
         "follower_max_speed": float(cfg.get("follower_max_speed", 0.4)),
         "follower_min_speed": float(cfg.get("follower_min_speed", 0.0)),
+        "follower_require_leader": bool(cfg.get("follower_require_leader", True)),
+        "follower_spacing_warmup_frames": int(cfg.get("follower_spacing_warmup_frames", 8)),
+        "follower_catchup_margin": float(cfg.get("follower_catchup_margin", 0.06)),
+        "follower_lane_fallback_speed": float(cfg.get("follower_lane_fallback_speed", 0.15)),
         "span_target_px": float(cfg.get("span_target_px", 32.0)),
         "spacing_kp": float(cfg.get("spacing_kp", 0.010)),
         "spacing_kd": float(cfg.get("spacing_kd", 0.018)),
@@ -186,7 +190,7 @@ def load_config() -> Dict[str, Any]:
         "intersection_aspect_baseline_frames": int(cfg.get("intersection_aspect_baseline_frames", 4)),
         "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
         "intersection_turn_delay_s": float(cfg.get("intersection_turn_delay_s", 2.0)),
-        "intersection_turn_wait_speed": float(cfg.get("intersection_turn_wait_speed", 0.12)),
+        "intersection_turn_wait_speed": float(cfg.get("intersection_turn_wait_speed", 0.0)),
         "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
         "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
         "intersection_straight_use_lane": bool(cfg.get("intersection_straight_use_lane", True)),
@@ -1330,6 +1334,8 @@ def _drive_follower(
     frame_dt,
     cfg,
     wheel_pwm=None,
+    *,
+    intersection_pwm=False,
 ) -> float:
     """Ramp to spacing target, then lane steer or intersection arc PWM."""
     commanded_speed = _ramp_toward(
@@ -1345,11 +1351,52 @@ def _drive_follower(
         left_pwm, right_pwm = commanded_speed, commanded_speed
 
     if wheels is not None and is_driving_enabled():
-        _apply_lane_wheels(wheels, left_pwm, right_pwm, commanded_speed, False)
+        # Cruise/convoy: scale lane steer to spacing speed. Intersection arcs: absolute PWM.
+        use_direct = bool(intersection_pwm)
+        _apply_lane_wheels(wheels, left_pwm, right_pwm, commanded_speed, use_direct)
         _remember_lane_pwm(lane_agent, left_pwm, right_pwm)
     elif wheels is not None:
         _safe_stop(wheels)
     return commanded_speed
+
+
+def _follower_cruise_target_speed(
+    spacing,
+    cfg,
+    follower_min,
+    follower_max,
+    cruise_speed,
+    slow_speed,
+    leader_visible,
+    leader_grid_samples,
+    last_span_px,
+):
+    """Spacing speed for normal cruise — conservative at startup, never blind full throttle."""
+    target_speed = spacing.compute_target_speed(cfg, follower_min, follower_max)
+
+    if bool(cfg.get("follower_require_leader", True)) and not leader_visible:
+        return follower_min
+
+    warmup = max(1, int(cfg.get("follower_spacing_warmup_frames", 8)))
+    if leader_visible and leader_grid_samples < warmup:
+        return min(target_speed, slow_speed)
+
+    if leader_visible:
+        catchup = max(0.0, float(cfg.get("follower_catchup_margin", 0.06)))
+        target_speed = min(target_speed, cruise_speed + catchup)
+    else:
+        target_speed = min(
+            target_speed,
+            float(cfg.get("follower_lane_fallback_speed", slow_speed)),
+        )
+
+    too_close_px = float(cfg.get("span_too_close_px", 44.0))
+    if last_span_px is not None and last_span_px >= too_close_px:
+        target_speed = min(
+            target_speed,
+            float(cfg.get("span_too_close_speed", 0.06)),
+        )
+    return max(follower_min, min(follower_max, target_speed))
 
 
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
@@ -1534,6 +1581,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     prev_mode = None
     leader_loss_streak = 0
     leader_visible = False
+    leader_grid_samples = 0
     last_distance_signal = None
     last_span_px = None
     line_streak = 0
@@ -1559,6 +1607,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             if grid_det is not None and grid_det.found:
                 leader_loss_streak = 0
                 leader_visible = True
+                leader_grid_samples = min(leader_grid_samples + 1, 1000)
                 last_distance_signal = grid_det.distance_signal
                 if grid_det.span_px is not None:
                     last_span_px = float(grid_det.span_px)
@@ -1580,6 +1629,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             line_streak >= red_confirm
             and is_driving_enabled()
             and intersection_phase is None
+            and turn_tracker.approach_active
         ):
             turn_dbg = turn_tracker.debug_votes(cfg)
             intersection_direction = turn_tracker.infer(cfg)
@@ -1604,19 +1654,30 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             )
 
         lane_agent = _get_lane_agent()
-        target_speed = spacing.compute_target_speed(cfg, follower_min, follower_max)
         wheel_pwm = None
         follow_mode = "cruise"
+        intersection_pwm = False
+        turn_cap = float(cfg.get("intersection_turn_speed", 0.15))
 
         if intersection_phase == "TURN":
             mode = STATE_INTERSECTION
+            target_speed = _follower_cruise_target_speed(
+                spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
+                leader_visible, leader_grid_samples, last_span_px,
+            )
             if (
                 intersection_direction in (TURN_LEFT, TURN_RIGHT)
                 and now < intersection_arc_start
             ):
                 wheel_pwm = None
-                wait_speed = float(cfg.get("intersection_turn_wait_speed", 0.12))
-                target_speed = min(target_speed, wait_speed)
+                wait_speed = max(0.0, float(cfg.get("intersection_turn_wait_speed", 0.0)))
+                too_close_px = float(
+                    cfg.get("intersection_turn_wait_too_close_px", cfg.get("span_too_close_px", 44.0))
+                )
+                if last_span_px is not None and last_span_px >= too_close_px:
+                    target_speed = 0.0
+                else:
+                    target_speed = min(target_speed, wait_speed)
                 follow_mode = f"turn_wait_{intersection_direction}"
             elif (
                 intersection_direction == TURN_STRAIGHT
@@ -1628,13 +1689,15 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                     if lane_pwm is not None
                     else intersection_wheel_commands(TURN_STRAIGHT, cfg)
                 )
-                turn_cap = float(cfg.get("intersection_turn_speed", 0.15))
                 target_speed = min(target_speed, turn_cap)
+                intersection_pwm = True
                 follow_mode = "turn_straight_lane"
             else:
                 in_tail = now >= intersection_arc_end
                 drive_dir = TURN_STRAIGHT if in_tail else intersection_direction
                 wheel_pwm = intersection_wheel_commands(drive_dir, cfg)
+                target_speed = min(target_speed, turn_cap)
+                intersection_pwm = True
                 follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
             if now >= intersection_end:
                 intersection_phase = "RECOVERY"
@@ -1644,6 +1707,10 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         elif intersection_phase == "RECOVERY":
             mode = STATE_INTERSECTION
             follow_mode = "recovery"
+            target_speed = _follower_cruise_target_speed(
+                spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
+                leader_visible, leader_grid_samples, last_span_px,
+            )
             recovery_min_s = float(cfg.get("intersection_recovery_min_s", 2.8))
             require_clear_red = bool(cfg.get("intersection_recovery_require_clear_red", True))
             if (now - recovery_started_at) >= recovery_min_s:
@@ -1662,9 +1729,14 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         else:
             mode = STATE_CRUISING
             follow_mode = "convoy" if leader_visible else "lane"
+            target_speed = _follower_cruise_target_speed(
+                spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
+                leader_visible, leader_grid_samples, last_span_px,
+            )
 
         commanded_speed = _drive_follower(
             wheels, lane_agent, frame_bgr, commanded_speed, target_speed, frame_dt, cfg, wheel_pwm,
+            intersection_pwm=intersection_pwm,
         )
 
         if mode != prev_mode:
