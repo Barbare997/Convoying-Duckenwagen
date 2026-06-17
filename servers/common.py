@@ -1,7 +1,24 @@
 import logging
 import re
+import threading
 import time
 import cv2
+
+
+class LatestFrame:
+    """Single-slot frame holder for sim agents (newest frame wins)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frame = None
+
+    def put_nowait(self, frame):
+        with self._lock:
+            self._frame = frame
+
+    def get_latest(self):
+        with self._lock:
+            return None if self._frame is None else self._frame.copy()
 
 
 class _HttpErrorsOnly(logging.Filter):

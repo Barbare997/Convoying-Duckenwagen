@@ -3,6 +3,9 @@ import sys
 import threading
 import time
 
+import cv2
+import numpy as np
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.normpath(os.path.join(script_dir, "..", "..", ".."))
 if project_root not in sys.path:
@@ -43,7 +46,7 @@ def test_next_state_transitions():
     assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_SLOW_SIGN) == agent.STATE_SLOW
     assert agent.next_state(agent.STATE_SLOW, agent.EVENT_NORMAL) == agent.STATE_CRUISING
     assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_STOP_SIGN) == agent.STATE_STOPPING
-    assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_TIMEOUT) == agent.STATE_STOPPING
+    assert agent.next_state(agent.STATE_CRUISING, agent.EVENT_LEADER_LOST) == agent.STATE_STOPPING
     print("OK: FSM transitions")
 
 
@@ -60,41 +63,165 @@ def test_config_loads():
     cfg = agent.load_config()
     assert isinstance(cfg, dict), "Config must be a dictionary"
     assert "role" in cfg, "Config missing role"
-    assert "leader_yolo_enabled" in cfg, "Config missing leader_yolo_enabled"
+    assert "grid_cols" in cfg, "Config missing grid_cols"
     print("OK: config loads")
 
 
-def test_yolo_leader_distance_signal():
+def test_grid_leader_distance_signal():
+    from tasks.project.packages import leader_grid
+
     cfg = {
         "role": "follower",
-        "leader_yolo_enabled": True,
-        "leader_class_id": 1,
-        "leader_center_roi": 1.0,
-        "leader_min_bbox_area": 100,
-        "leader_min_y2_frac": 0.1,
+        "grid_cols": 7,
+        "grid_rows": 3,
+        "grid_downscale": 1.0,
+        "grid_far_search": False,
+        "grid_use_clustering": False,
+        "grid_blob_min_area": 10,
+        "grid_blob_min_circularity": 0.5,
+        "grid_safe_px": 10,
+        "grid_stop_px": 80,
     }
-    import numpy as np
+    leader_grid.reset_grid_tracker()
+    frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+    cols, rows = 7, 3
+    x0, y0 = 180, 280
+    dx, dy = 45, 45
+    r = 12
+    for row in range(rows):
+        for col in range(cols):
+            cx = x0 + col * dx
+            cy = y0 + row * dy
+            cv2.circle(frame, (cx, cy), r, (0, 0, 0), -1)
 
+    det = leader_grid.detect_leader_grid(frame, cfg)
+    assert det.found, "Synthetic 7x3 grid should be detected"
+    assert det.distance_signal is not None
+    assert det.span_px is not None
+    print("OK: circle grid detection on synthetic pattern")
+
+
+def test_grid_spacing_controller():
+    from tasks.project.packages.follower_spacing import GridSpacingController
+
+    cfg = {
+        "span_target_px": 32.0,
+        "spacing_kp": 0.010,
+        "spacing_kd": 0.018,
+        "spacing_span_dot_alpha": 1.0,
+        "spacing_leader_alpha": 0.5,
+        "spacing_leader_ff_gain": 0.012,
+        "spacing_steady_span_px": 100.0,
+        "spacing_steady_span_dot": 1000.0,
+        "span_too_close_px": 50.0,
+        "span_too_close_speed": 0.05,
+    }
+    ctl = GridSpacingController()
+    ctl.observe(28.0, 0.0, cfg, 0.35)
+    ctl.observe(28.0, 0.1, cfg, 0.35)
+    v_far = ctl.compute_target_speed(cfg, 0.0, 0.48)
+    assert v_far > 0.2, "below span_target should catch up"
+
+    ctl.observe(38.0, 0.2, cfg, 0.35)
+    ctl.observe(40.0, 0.3, cfg, 0.35)
+    v_close = ctl.compute_target_speed(cfg, 0.0, 0.48)
+    assert v_close < v_far, "above span_target / closing should slow down"
+    print("OK: grid spacing controller")
+
+
+def test_follower_grid_signal_mock():
+    from tasks.project.packages.leader_grid import GridDetection
+
+    cfg = {"role": "follower", "grid_detect_hz": 10}
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    # Farther truck: smaller, higher in image
-    far = ((200, 80, 280, 200), 0.9, 1)
-    # Closer truck: larger, lower in image
-    near = ((220, 200, 420, 420), 0.9, 1)
+    fake = GridDetection(True, 0.42, 1.0, None, (7, 3))
+    original = agent.fetch_leader_grid
+    try:
+        agent.fetch_leader_grid = lambda _f, _c, force=False: fake
+        det = agent.fetch_leader_grid(frame, cfg)
+        assert det.found and det.distance_signal == 0.42
+    finally:
+        agent.fetch_leader_grid = original
+    print("OK: follower grid fetch")
 
-    class FakeDet:
-        model_loaded = True
-        img_size = 640
 
-        def detect(self, _rgb):
-            return [far, near]
+def test_red_at_line_near_band():
+    from tasks.project.packages.intersection_follow import measure_red_at_line
 
-    agent._detection_agent = FakeDet()
-    agent._detection_init_attempted = True
-    signal, conf = agent.estimate_leader_distance_from_yolo(frame, cfg)
-    assert signal is not None and conf == 0.9
-    near_signal = agent._leader_truck_distance_signal(near[0], frame.shape[:2])
-    assert abs(signal - near_signal) < 1e-6
-    print("OK: YOLO leader distance picks nearest truck")
+    cfg = {
+        "intersection_red_near_top_frac": 0.72,
+        "intersection_red_far_top_frac": 0.35,
+        "intersection_red_near_min_pixels": 2000,
+        "intersection_red_near_min_frac": 0.05,
+        "intersection_red_near_far_ratio": 2.0,
+    }
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    far = measure_red_at_line(frame, cfg)
+    assert not far.at_line
+
+    # Distant red only (middle band) — must NOT trigger
+    frame[200:340, 200:440] = (0, 0, 255)
+    mid = measure_red_at_line(frame, cfg)
+    assert not mid.at_line
+
+    # Dense red under the bot only (bottom band) — far band empty
+    frame2 = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame2[360:470, 80:560] = (0, 0, 255)
+    near = measure_red_at_line(frame2, cfg)
+    assert near.at_line
+    print("OK: intersection triggers only on near red band")
+
+
+def test_leader_turn_tracker():
+    from tasks.project.packages.intersection_follow import (
+        LeaderTurnTracker,
+        RedLineProximity,
+        TURN_LEFT,
+        TURN_RIGHT,
+        TURN_STRAIGHT,
+    )
+    from tasks.project.packages.leader_grid import GridDetection
+
+    cfg = {
+        "intersection_cx_drift_px": 20,
+        "intersection_heading_thresh": 0.1,
+        "intersection_turn_infer_lookback": 10,
+        "intersection_red_approach_min_far_px": 100,
+    }
+    pat = (7, 3)
+    tr = LeaderTurnTracker(window=10)
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for cx in range(100, 160, 5):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=0.15,
+        ))
+    assert tr.infer(cfg) == TURN_RIGHT, "cx + heading agree => right"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for cx in range(200, 140, -5):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=-0.15,
+        ))
+    assert tr.infer(cfg) == TURN_LEFT, "cx + heading agree => left"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for cx in range(100, 160, 5):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=-0.15,
+        ))
+    assert tr.infer(cfg) == TURN_STRAIGHT, "disagreeing signals => straight"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for cx in [150, 152, 151, 153, 150, 152]:
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=0.02,
+        ))
+    assert tr.infer(cfg) == TURN_STRAIGHT, "small drift on straight => straight"
+
+    print("OK: leader turn tracker")
 
 
 def test_role_dispatch():
@@ -288,7 +415,11 @@ if __name__ == "__main__":
     test_next_state_transitions()
     test_smooth_stop()
     test_config_loads()
-    test_yolo_leader_distance_signal()
+    test_grid_leader_distance_signal()
+    test_follower_grid_signal_mock()
+    test_grid_spacing_controller()
+    test_red_at_line_near_band()
+    test_leader_turn_tracker()
     test_slow_sign_delay()
     test_tag_slow_distance_engages()
     test_tag_slow_candidate_not_stale_normal()

@@ -5,6 +5,25 @@ HSV_EXTRA_CSS = '''
 .hsv-section-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 12px 0 8px; text-transform: uppercase; letter-spacing: 0.5px; }
 .hsv-section-title.yellow { color: #f1c40f; }
 .hsv-section-title.white  { color: #ecf0f1; }
+.hsv-section-title.red    { color: #e74c3c; }
+.hsv-color-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 16px;
+    margin-top: 8px;
+}
+.hsv-color-col {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 10px 4px;
+    background: var(--bg-sidebar);
+}
+.hsv-color-col.yellow { border-color: rgba(241, 196, 15, 0.45); }
+.hsv-color-col.red    { border-color: rgba(231, 76, 60, 0.45); }
+.hsv-color-col .hsv-section-title { margin-top: 0; }
+@media (max-width: 900px) {
+    .hsv-color-grid { grid-template-columns: 1fr; }
+}
 .video-stack { flex-direction: column; align-items: stretch; }
 .video-stack .stream { flex: 1; min-height: 0; }
 .stream-pickable { cursor: crosshair; }
@@ -43,6 +62,8 @@ HSV_CARD_HTML = '''
             <div class="card">
                 <div class="card-header">HSV Color Calibration</div>
 
+                <div class="hsv-color-grid">
+                <div class="hsv-color-col yellow">
                 <div class="hsv-section-title yellow">Yellow Line (left / dashed)</div>
 
                 <div class="slider-group">
@@ -86,6 +107,55 @@ HSV_CARD_HTML = '''
                         <input type="range" id="yHighV" min="0" max="255" value="255" class="slider">
                         <input type="number" id="yHighV-input" min="0" max="255" value="255" class="input-box">
                     </div>
+                </div>
+                </div>
+
+                <div class="hsv-color-col red">
+                <div class="hsv-section-title red">Red Line (left / center)</div>
+
+                <div class="slider-group">
+                    <div class="slider-label"><span>Hue Low</span><span style="color:var(--text-muted)">0-179</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rLowH" min="0" max="179" value="0" class="slider">
+                        <input type="number" id="rLowH-input" min="0" max="179" value="0" class="input-box">
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <div class="slider-label"><span>Hue High</span><span style="color:var(--text-muted)">0-179</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rHighH" min="0" max="179" value="10" class="slider">
+                        <input type="number" id="rHighH-input" min="0" max="179" value="10" class="input-box">
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <div class="slider-label"><span>Saturation Low</span><span style="color:var(--text-muted)">0-255</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rLowS" min="0" max="255" value="100" class="slider">
+                        <input type="number" id="rLowS-input" min="0" max="255" value="100" class="input-box">
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <div class="slider-label"><span>Saturation High</span><span style="color:var(--text-muted)">0-255</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rHighS" min="0" max="255" value="255" class="slider">
+                        <input type="number" id="rHighS-input" min="0" max="255" value="255" class="input-box">
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <div class="slider-label"><span>Value Low</span><span style="color:var(--text-muted)">0-255</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rLowV" min="0" max="255" value="100" class="slider">
+                        <input type="number" id="rLowV-input" min="0" max="255" value="100" class="input-box">
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <div class="slider-label"><span>Value High</span><span style="color:var(--text-muted)">0-255</span></div>
+                    <div class="slider-controls">
+                        <input type="range" id="rHighV" min="0" max="255" value="255" class="slider">
+                        <input type="number" id="rHighV-input" min="0" max="255" value="255" class="input-box">
+                    </div>
+                </div>
+                </div>
                 </div>
 
                 <div class="hsv-section-title white" style="margin-top:20px">White Line (right / solid)</div>
@@ -139,9 +209,11 @@ HSV_CARD_HTML = '''
                     <div class="pick-row"><span>HSV</span><span id="pick-hsv" class="info-value">-</span></div>
                     <div class="pick-row"><span>Guess</span><span id="pick-guess" class="info-value">-</span></div>
                     <div class="pick-row"><span>Suggested yellow</span><span id="pick-yellow" class="info-value">-</span></div>
+                    <div class="pick-row"><span>Suggested red</span><span id="pick-red" class="info-value">-</span></div>
                     <div class="pick-row"><span>Suggested white</span><span id="pick-white" class="info-value">-</span></div>
                     <div class="pick-actions">
                         <button type="button" class="button" style="background:#b8860b" onclick="applyPickedColor('yellow')">Apply as Yellow</button>
+                        <button type="button" class="button" style="background:#c0392b" onclick="applyPickedColor('red')">Apply as Red</button>
                         <button type="button" class="button" style="background:#5c6b7a" onclick="applyPickedColor('white')">Apply as White</button>
                     </div>
                 </div>
@@ -166,6 +238,12 @@ HSV_EXTRA_JS = '''
             setSliderValue('wHighS', d.white_upper_s);
             setSliderValue('wLowV',  d.white_lower_v);
             setSliderValue('wHighV', d.white_upper_v);
+            setSliderValue('rLowH',  d.red_lower_h);
+            setSliderValue('rHighH', d.red_upper_h);
+            setSliderValue('rLowS',  d.red_lower_s);
+            setSliderValue('rHighS', d.red_upper_s);
+            setSliderValue('rLowV',  d.red_lower_v);
+            setSliderValue('rHighV', d.red_upper_v);
         });
 
     const hsvKeys = {
@@ -175,6 +253,9 @@ HSV_EXTRA_JS = '''
         'wLowH':  'white_lower_h',  'wHighH': 'white_upper_h',
         'wLowS':  'white_lower_s',  'wHighS': 'white_upper_s',
         'wLowV':  'white_lower_v',  'wHighV': 'white_upper_v',
+        'rLowH':  'red_lower_h',  'rHighH': 'red_upper_h',
+        'rLowS':  'red_lower_s',  'rHighS': 'red_upper_s',
+        'rLowV':  'red_lower_v',  'rHighV': 'red_upper_v',
     };
 
     Object.entries(hsvKeys).forEach(([sliderId, key]) => {
@@ -221,6 +302,8 @@ HSV_EXTRA_JS = '''
         document.getElementById('pick-guess').textContent = data.line_guess;
         document.getElementById('pick-yellow').textContent =
             formatBounds('y', data.suggested_yellow);
+        document.getElementById('pick-red').textContent =
+            formatBounds('r', data.suggested_red);
         document.getElementById('pick-white').textContent =
             formatBounds('w', data.suggested_white);
     }
@@ -230,8 +313,10 @@ HSV_EXTRA_JS = '''
             showStatus('hsv-status', 'Click the camera panel first.', 'error');
             return;
         }
-        const b = which === 'yellow' ? lastPick.suggested_yellow : lastPick.suggested_white;
-        const prefix = which === 'yellow' ? 'y' : 'w';
+        const boundsKey = which === 'yellow' ? 'suggested_yellow'
+            : which === 'red' ? 'suggested_red' : 'suggested_white';
+        const b = lastPick[boundsKey];
+        const prefix = which === 'yellow' ? 'y' : which === 'red' ? 'r' : 'w';
         setSliderValue(prefix + 'LowH',  b.lower_h);
         setSliderValue(prefix + 'HighH', b.upper_h);
         setSliderValue(prefix + 'LowS',  b.lower_s);
@@ -247,6 +332,13 @@ HSV_EXTRA_JS = '''
             payload.yellow_upper_s = b.upper_s;
             payload.yellow_lower_v = b.lower_v;
             payload.yellow_upper_v = b.upper_v;
+        } else if (which === 'red') {
+            payload.red_lower_h = b.lower_h;
+            payload.red_upper_h = b.upper_h;
+            payload.red_lower_s = b.lower_s;
+            payload.red_upper_s = b.upper_s;
+            payload.red_lower_v = b.lower_v;
+            payload.red_upper_v = b.upper_v;
         } else {
             payload.white_lower_h = b.lower_h;
             payload.white_upper_h = b.upper_h;

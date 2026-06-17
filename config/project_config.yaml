@@ -1,77 +1,170 @@
 role: follower
-leader_host: kvati.local
-# Must match leader project server port (real_server default 5000)
-leader_port: 5055
+
 
 
 # Sign input: both = UI buttons + AprilTags (buttons win when Slow/Stop latched)
-# Use manual on leader if AprilTags unavailable; follower always follows HTTP state.
+
 sign_source: both
 
+
+
 # Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
-# Follower always scales lane PWM to cruise_speed / leader status / YOLO.
+
+# Follower scales lane PWM to cruise_speed + circle-grid spacing when leader visible.
+# When leader grid is lost, follower falls back to lane-only follow (direct PWM if true).
+
 lane_use_direct_pwm: true
+
 cruise_speed: 0.40
+
 slow_speed: 0.15
 
-follower_max_speed: 0.40
-follower_min_speed: 0.0
-# Normalized leader proximity from YOLO truck box. Tune while following in sim/hardware.
-distance_target: 0.05
-#error = distance_target - distance_signal, target_speed += distance_kp * error
-distance_kp: 0.6
-#If follower’s last successful leader status is older than 0.4 seconds, treat leader as lost → stop.
-leader_timeout_s: 0.4
 
-#leader updates its status every status_publish_hz times per second
-status_publish_hz: 10
-#follower asks leader's status every status_poll_hz times per second
-status_poll_hz: 10
-#Each HTTP request to leader waits max 0.2 s before giving up that poll.
-request_timeout_s: 0.2
-stop_hold_s: 2.0
-# Slow button: stay in SLOW this long, then auto-resume to CRUISING (follower follows via HTTP)
+
+follower_max_speed: 0.48
+
+follower_min_speed: 0.0
+
+# --- Grid spacing (span_px = mean dot spacing; grows as leader gets closer) ---
+# Park at desired gap on the bot, read span_px from logs, set span_target_px to that value.
+# Lower span_target_px = stay farther back (smaller dots in frame).
+span_target_px: 28.0
+spacing_kp: 0.012
+spacing_kd: 0.022
+spacing_span_dot_alpha: 0.35
+spacing_leader_alpha: 0.12
+spacing_leader_ff_gain: 0.012
+spacing_steady_span_px: 5.0
+spacing_steady_span_dot: 10.0
+span_too_close_px: 44.0
+span_too_close_speed: 0.06
+
+# Circle-grid detect rate for follower (Hz)
+
+grid_detect_hz: 10
+
+# Treat leader as lost after this many consecutive frames without a valid grid (lane follow continues)
+
+leader_loss_confirm_frames: 3
+
+# Red-line intersection: near band = bottom of frame (lower frac => trigger earlier)
+intersection_red_near_top_frac: 0.65
+intersection_red_far_top_frac: 0.35
+intersection_red_near_min_pixels: 2200
+intersection_red_near_min_frac: 0.038
+intersection_red_near_far_ratio: 1.6
+intersection_red_confirm_frames: 2
+intersection_red_approach_min_far_px: 600
+intersection_turn_track_window: 20
+intersection_turn_infer_lookback: 8
+intersection_cx_drift_px: 30
+intersection_heading_thresh: 0.12
+# Turn/recovery speeds (~slow_speed); outer/inner ratio sets differential arc
+intersection_turn_speed: 0.15
+intersection_turn_inner_ratio: 0.27
+intersection_turn_outer_ratio: 1.0
+intersection_turn_straight_s: 1.4
+intersection_turn_left_s: 2.1
+intersection_turn_right_s: 2.1
+# Extra straight driving at end of TURN (same phase, after arc timer)
+intersection_turn_tail_straight_s: 1.6
+intersection_recovery_min_s: 2.8
+intersection_recovery_lane_frames: 20
+intersection_recovery_min_lane_px: 700
+intersection_recovery_max_red_px: 500
+intersection_recovery_require_clear_red: true
+
+
+# Leader rear dot grid (7 columns x 3 rows, black dots on white)
+
+grid_cols: 7
+
+grid_rows: 3
+
+grid_center_roi: 0.75
+
+grid_min_bbox_area: 400
+
+grid_min_y2_frac: 0.15
+
+grid_blob_min_area: 20
+
+grid_blob_max_area: 12000
+
+grid_min_circularity: 0.5
+
+grid_blur: true
+
+grid_blur_ksize: 5
+
+grid_clustering: true
+
+# MarkerGridTracker (duckietown-convoy style — ROI + far-band + grace)
+grid_downscale: 0.5
+grid_roi_pad_px: 60
+grid_roi_downscale: 1.0
+grid_far_search: true
+grid_far_band_top_frac: 0.10
+grid_far_band_bot_frac: 0.45
+grid_lost_grace_frames: 6
+grid_use_clustering: false
+grid_blob_min_circularity: 0.6
+# Span px thresholds: map dot spacing to distance_signal (tune in sim UI overlay)
+# Wider stop-safe gap = signal rises slower as you approach the leader.
+grid_safe_px: 18
+grid_stop_px: 48
+
+
 slow_hold_s: 4.0
-# Sign Stop: ramp down over decel_time_s, hold stop_hold_s, then auto-resume
+
 decel_time_s: 1.2
+
 decel_steps: 10
-# Cruise <-> slow: ramp over this many seconds (not instant)
+
 speed_ramp_s: 1.0
 
-# AprilTag event mapping (fill real IDs from your sign set)
+
+
 stop_tag_ids: [20,21,22,23,24,25,26,27,28,29]
+
 slow_tag_ids: [39]
 
-# Follower leader spacing (YOLO class "truck" = leader Duckiebot)
-leader_yolo_enabled: true
-leader_class_id: 1
-#If the leader is detected in the Rregion of interest, follower will try to follow it.
-leader_center_roi: 0.65
-leader_min_bbox_area: 500
-#If the leader's bounding box is not at least 0.25 of the image height, follower will not try to follow it.
-leader_min_y2_frac: 0.25
 
-# Detection stability controls
-# Slow sign: start slowing when tag pose distance <= sign_slow_distance_m (dt_apriltags pose_t).
-# Resume cruise when tag is lost (confirmed) and speed ramp to slow_speed is complete.
+
 sign_slow_mode: distance
+
 sign_slow_distance_m: 0.40
+
 sign_slow_loss_confirm_frames: 2
+
 sign_tag_size_m: 0.065
-# Camera intrinsics for AprilTag pose (640x480 Duckiebot defaults; tune if needed).
+
 camera_fx: 337.8
+
 camera_fy: 337.3
+
 camera_cx: 324.0
+
 camera_cy: 239.3
+
 camera_calib_width: 640
+
 camera_calib_height: 480
+
 sign_confirm_frames: 3
+
 sign_cooldown_s: 2.0
+
 sign_center_roi: 1.0
-# Legacy time-based slow (sign_slow_mode: delay) — kept for fallback tuning.
+
 sign_slow_delay_s: 2.5
-# Stop sign: keep driving while tag visible; STOP when tag leaves view (see README).
+
 sign_stop_on_loss: true
+
 sign_stop_seen_min_frames: 8
+
 sign_stop_loss_confirm_frames: 2
+
 sign_stop_rearm_s: 6.0
+
+

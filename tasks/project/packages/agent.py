@@ -7,8 +7,21 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
  
 import cv2
-import requests #HTTP requests to leader
 import yaml
+from tasks.project.packages.follower_spacing import GridSpacingController
+from tasks.project.packages.intersection_follow import (
+    LeaderTurnTracker,
+    intersection_turn_duration,
+    intersection_wheel_commands,
+    lane_frame_ok_for_recovery,
+    measure_red_at_line,
+)
+from tasks.project.packages.leader_grid import (
+    GridDetection,
+    draw_grid_overlay,
+    fetch_leader_grid,
+    get_cached_grid_detection,
+)
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
  
 _CONFIG_PATH = os.path.normpath(
@@ -20,28 +33,22 @@ STATE_CRUISING = "CRUISING"
 STATE_SLOW = "SLOW"
 STATE_STOPPING = "STOPPING"
 STATE_STOPPED = "STOPPED"
+STATE_INTERSECTION = "INTERSECTION"
 
 # Events
 EVENT_NORMAL = "EVENT_NORMAL"
 EVENT_SLOW_SIGN = "EVENT_SLOW_SIGN"
 EVENT_STOP_SIGN = "EVENT_STOP_SIGN"
-EVENT_TIMEOUT = "EVENT_TIMEOUT"
+EVENT_LEADER_LOST = "EVENT_LEADER_LOST"
 
-# Shared leader status contract (used by both teammates):
-# {
-#   "state": "STOPPED" | "CRUISING" | "SLOW",
-#   "speed": <float>,            # commanded forward speed in [0, 1]
-#   "ts": <float>                # Unix timestamp from time.time()
-# }
-#
-# Follower-side rule:
-# if current_time - payload["ts"] > leader_timeout_s -> treat as stale and stop.
- 
 _status_lock = threading.Lock()
-_leader_status: Dict[str, Any] = {
-    "state": "STOPPED",
+_convoy_ui_status: Dict[str, Any] = {
+    "state": STATE_STOPPED,
     "speed": 0.0,
-    "ts": float(time.time()),
+    "event": EVENT_NORMAL,
+    "tag_ids": [],
+    "dist_signal": None,
+    "leader_visible": False,
 }
 
 _apriltag_detector = None
@@ -64,13 +71,6 @@ _sign_runtime = {
 _lane_agent: Optional[LaneServoingAgent] = None
 _driving_enabled = False
 _driving_lock = threading.Lock()
-_detection_agent = None
-_detection_init_attempted = False
-_yolo_load_error: Optional[str] = None
-_yolo_ready_logged = False
-_yolo_detect_cache_lock = threading.Lock()
-_yolo_detect_cache_ts = 0.0
-_yolo_detect_cache_dets: list = []
 
 # Manual convoy commands (Plan B when AprilTags unavailable).
 MANUAL_CRUISING = "CRUISING"
@@ -81,10 +81,6 @@ _VALID_MANUAL_COMMANDS = {MANUAL_CRUISING, MANUAL_SLOW, MANUAL_STOPPED}
 _manual_convoy_cmd = MANUAL_CRUISING
 _manual_lock = threading.Lock()
 _manual_slow_until = 0.0
-_follower_leader_mirror: Dict[str, Any] = {}
-
-# YOLO class id for leader Duckiebot (trained as "truck" in object_detection task).
-LEADER_YOLO_CLASS_ID = 1
 
 
 def load_config() -> Dict[str, Any]:
@@ -97,18 +93,44 @@ def load_config() -> Dict[str, Any]:
  
     return {
         "role": str(cfg.get("role", "leader")).strip().lower(),
-        "leader_host": str(cfg.get("leader_host", "127.0.0.1")).strip(),
-        "leader_port": int(cfg.get("leader_port", 5055)),
         "cruise_speed": float(cfg.get("cruise_speed", 0.4)),
         "slow_speed": float(cfg.get("slow_speed", 0.15)),
         "follower_max_speed": float(cfg.get("follower_max_speed", 0.4)),
         "follower_min_speed": float(cfg.get("follower_min_speed", 0.0)),
-        "distance_target": float(cfg.get("distance_target", 0.06)),
-        "distance_kp": float(cfg.get("distance_kp", 0.6)),
-        "status_publish_hz": float(cfg.get("status_publish_hz", 10)),
-        "status_poll_hz": float(cfg.get("status_poll_hz", 10)),
-        "request_timeout_s": float(cfg.get("request_timeout_s", 0.2)),
-        "leader_timeout_s": float(cfg.get("leader_timeout_s", 0.4)),
+        "span_target_px": float(cfg.get("span_target_px", 32.0)),
+        "spacing_kp": float(cfg.get("spacing_kp", 0.010)),
+        "spacing_kd": float(cfg.get("spacing_kd", 0.018)),
+        "spacing_span_dot_alpha": float(cfg.get("spacing_span_dot_alpha", 0.35)),
+        "spacing_leader_alpha": float(cfg.get("spacing_leader_alpha", 0.12)),
+        "spacing_leader_ff_gain": float(cfg.get("spacing_leader_ff_gain", 0.012)),
+        "spacing_steady_span_px": float(cfg.get("spacing_steady_span_px", 5.0)),
+        "spacing_steady_span_dot": float(cfg.get("spacing_steady_span_dot", 10.0)),
+        "span_too_close_px": float(cfg.get("span_too_close_px", 44.0)),
+        "span_too_close_speed": float(cfg.get("span_too_close_speed", 0.06)),
+        "grid_detect_hz": float(cfg.get("grid_detect_hz", 10)),
+        "leader_loss_confirm_frames": int(cfg.get("leader_loss_confirm_frames", 3)),
+        "grid_cols": int(cfg.get("grid_cols", 7)),
+        "grid_rows": int(cfg.get("grid_rows", 3)),
+        "grid_center_roi": float(cfg.get("grid_center_roi", 0.75)),
+        "grid_min_bbox_area": int(cfg.get("grid_min_bbox_area", 400)),
+        "grid_min_y2_frac": float(cfg.get("grid_min_y2_frac", 0.15)),
+        "grid_blob_min_area": float(cfg.get("grid_blob_min_area", 20)),
+        "grid_blob_max_area": float(cfg.get("grid_blob_max_area", 12000)),
+        "grid_min_circularity": float(cfg.get("grid_min_circularity", 0.5)),
+        "grid_blur": bool(cfg.get("grid_blur", True)),
+        "grid_blur_ksize": int(cfg.get("grid_blur_ksize", 5)),
+        "grid_clustering": bool(cfg.get("grid_clustering", True)),
+        "grid_downscale": float(cfg.get("grid_downscale", 0.5)),
+        "grid_roi_pad_px": int(cfg.get("grid_roi_pad_px", 60)),
+        "grid_roi_downscale": float(cfg.get("grid_roi_downscale", 1.0)),
+        "grid_far_search": bool(cfg.get("grid_far_search", True)),
+        "grid_far_band_top_frac": float(cfg.get("grid_far_band_top_frac", 0.10)),
+        "grid_far_band_bot_frac": float(cfg.get("grid_far_band_bot_frac", 0.45)),
+        "grid_lost_grace_frames": int(cfg.get("grid_lost_grace_frames", 6)),
+        "grid_use_clustering": bool(cfg.get("grid_use_clustering", False)),
+        "grid_blob_min_circularity": float(cfg.get("grid_blob_min_circularity", 0.6)),
+        "grid_safe_px": float(cfg.get("grid_safe_px", 20.0)),
+        "grid_stop_px": float(cfg.get("grid_stop_px", 42.0)),
         "stop_hold_s": float(cfg.get("stop_hold_s", 2.0)),
         "slow_hold_s": float(cfg.get("slow_hold_s", 4.0)),
         "decel_time_s": float(cfg.get("decel_time_s", 1.2)),
@@ -136,16 +158,35 @@ def load_config() -> Dict[str, Any]:
         "camera_cy": float(cfg.get("camera_cy", 239.3)),
         "camera_calib_width": float(cfg.get("camera_calib_width", 640)),
         "camera_calib_height": float(cfg.get("camera_calib_height", 480)),
-        "leader_class_id": int(cfg.get("leader_class_id", LEADER_YOLO_CLASS_ID)),
-        "leader_yolo_enabled": bool(cfg.get("leader_yolo_enabled", True)),
-        "leader_center_roi": float(cfg.get("leader_center_roi", 0.65)),
-        "leader_min_bbox_area": int(cfg.get("leader_min_bbox_area", 400)),
-        "leader_min_y2_frac": float(cfg.get("leader_min_y2_frac", 0.25)),
         # True: send LaneServoingAgent PWM as-is (same as visual_lane_servoing task).
         # False: scale PWM so max(left,right) = cruise/slow speed from this file.
         "lane_use_direct_pwm": bool(cfg.get("lane_use_direct_pwm", False)),
         # Sign input: apriltag | manual | both (manual overrides when not CRUISING).
         "sign_source": str(cfg.get("sign_source", "both")).strip().lower(),
+        # Red-line intersection (follower): trigger only on near (bottom-band) red paint.
+        "intersection_red_near_top_frac": float(cfg.get("intersection_red_near_top_frac", 0.72)),
+        "intersection_red_far_top_frac": float(cfg.get("intersection_red_far_top_frac", 0.35)),
+        "intersection_red_near_min_pixels": int(cfg.get("intersection_red_near_min_pixels", 3500)),
+        "intersection_red_near_min_frac": float(cfg.get("intersection_red_near_min_frac", 0.055)),
+        "intersection_red_near_far_ratio": float(cfg.get("intersection_red_near_far_ratio", 2.0)),
+        "intersection_red_confirm_frames": int(cfg.get("intersection_red_confirm_frames", 3)),
+        "intersection_red_approach_min_far_px": int(cfg.get("intersection_red_approach_min_far_px", 600)),
+        "intersection_turn_track_window": int(cfg.get("intersection_turn_track_window", 20)),
+        "intersection_turn_infer_lookback": int(cfg.get("intersection_turn_infer_lookback", 8)),
+        "intersection_cx_drift_px": float(cfg.get("intersection_cx_drift_px", 30.0)),
+        "intersection_heading_thresh": float(cfg.get("intersection_heading_thresh", 0.12)),
+        "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
+        "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
+        "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
+        "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.2)),
+        "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 1.8)),
+        "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.8)),
+        "intersection_turn_tail_straight_s": float(cfg.get("intersection_turn_tail_straight_s", 1.6)),
+        "intersection_recovery_min_s": float(cfg.get("intersection_recovery_min_s", 2.8)),
+        "intersection_recovery_lane_frames": int(cfg.get("intersection_recovery_lane_frames", 20)),
+        "intersection_recovery_min_lane_px": int(cfg.get("intersection_recovery_min_lane_px", 700)),
+        "intersection_recovery_max_red_px": int(cfg.get("intersection_recovery_max_red_px", 500)),
+        "intersection_recovery_require_clear_red": bool(cfg.get("intersection_recovery_require_clear_red", True)),
     }
 
 
@@ -246,50 +287,19 @@ def _resolve_leader_event(
     return tag_e
 
 
-def get_yolo_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    enabled = bool(cfg.get("leader_yolo_enabled", True))
-    if not enabled:
-        return {
-            "enabled": False,
-            "loaded": False,
-            "ready": False,
-            "pending": False,
-            "error": None,
-        }
-
-    if not _detection_init_attempted:
-        return {
-            "enabled": True,
-            "loaded": False,
-            "ready": False,
-            "pending": True,
-            "trt_building": False,
-            "trt_elapsed_s": 0,
-            "error": None,
-        }
-
-    agent = _detection_agent
-    if agent is not None and getattr(agent, "trt_building", False):
-        return {
-            "enabled": True,
-            "loaded": False,
-            "ready": False,
-            "pending": True,
-            "trt_building": True,
-            "trt_elapsed_s": int(getattr(agent, "trt_build_elapsed", 0)),
-            "error": None,
-        }
-
-    agent_ok = agent is not None and getattr(agent, "model_loaded", False)
-    return {
-        "enabled": True,
-        "loaded": agent_ok,
-        "ready": agent_ok,
-        "pending": False,
-        "trt_building": False,
-        "trt_elapsed_s": 0,
-        "error": _yolo_load_error if not agent_ok else None,
+def get_grid_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cols = int(cfg.get("grid_cols", 7))
+    rows = int(cfg.get("grid_rows", 3))
+    cached = get_cached_grid_detection()
+    out = {
+        "ready": True,
+        "method": "marker_grid",
+        "pattern": f"{cols}x{rows}",
+        "last_found": bool(cached.found) if cached is not None else False,
     }
+    if cached is not None and cached.span_px is not None:
+        out["span_px"] = round(float(cached.span_px), 1)
+    return out
 
 
 def get_runtime_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -300,38 +310,20 @@ def get_runtime_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "driving_enabled": is_driving_enabled(),
     }
     if role == "follower":
-        out["yolo"] = get_yolo_status(cfg)
-        with _status_lock:
-            if _follower_leader_mirror:
-                out["leader"] = dict(_follower_leader_mirror)
+        out["grid"] = get_grid_status(cfg)
     elif role == "leader":
         out["apriltag_available"] = apriltag_detector_ready()
     return out
 
 
-def _update_follower_leader_mirror(payload: Dict[str, Any]) -> None:
-    global _follower_leader_mirror
+def _update_convoy_ui_status(**fields) -> None:
     with _status_lock:
-        _follower_leader_mirror = dict(payload)
- 
- 
-def build_status_payload(state: str, speed: float) -> Dict[str, Any]:
-    """Create the canonical leader status payload shared by leader/follower code."""
-    return {
-        "state": str(state).upper(),
-        "speed": float(speed),
-        "ts": float(time.time()),
-    }
- 
- 
-def set_leader_status(payload: Dict[str, Any]) -> None:
+        _convoy_ui_status.update(fields)
+
+
+def get_convoy_ui_status() -> Dict[str, Any]:
     with _status_lock:
-        _leader_status.update(payload)
- 
- 
-def get_leader_status() -> Dict[str, Any]:
-    with _status_lock:
-        return dict(_leader_status)
+        return dict(_convoy_ui_status)
  
  
 def _safe_stop(wheels) -> None:
@@ -379,7 +371,7 @@ def _apply_convoy_leds(
         cruise = max(1e-6, float(cruise_speed))
         slow = max(0.0, float(slow_speed))
 
-        if state_u in (STATE_STOPPED, STATE_STOPPING, EVENT_TIMEOUT):
+        if state_u in (STATE_STOPPED, STATE_STOPPING):
             leds.set_rgb(0, _LED_OFF)
             leds.set_rgb(2, _LED_OFF)
             leds.set_all_back(_LED_RED)
@@ -469,7 +461,7 @@ def _leader_use_direct_pwm(
 
 
 def next_state(current_state: str, event: str) -> str:
-    if event == EVENT_TIMEOUT:
+    if event == EVENT_LEADER_LOST:
         return STATE_STOPPING
     if event == EVENT_STOP_SIGN:
         return STATE_STOPPING
@@ -1221,167 +1213,18 @@ def detect_sign_event(
     return _slow_event_from_detections(seen_slow, slow_distance_m, cfg, now, cooldown_s)
 
 
-def _get_detection_agent():
-    """Lazy-load YOLO agent for follower leader spacing (optional onnxruntime)."""
-    global _detection_agent, _detection_init_attempted, _yolo_load_error, _yolo_ready_logged
-    if _detection_init_attempted:
-        return _detection_agent
-
-    _detection_init_attempted = True
-    _yolo_load_error = None
-    _yolo_ready_logged = False
-    try:
-        from tasks.object_detection.packages.agent import ObjectDetectionAgent
-
-        _detection_agent = ObjectDetectionAgent()
-        if _detection_agent.model_loaded:
-            _yolo_ready_logged = True
-            print(
-                f"[Project][YOLO] Leader spacing model ready "
-                f"(img_size={_detection_agent.img_size}).",
-                flush=True,
-            )
-        elif getattr(_detection_agent, "trt_building", False):
-            print(
-                "[Project][YOLO] TensorRT compiling (~1 min) — "
-                "leader spacing will activate when ready",
-                flush=True,
-            )
-        else:
-            _yolo_load_error = str(_detection_agent.load_error or "model not loaded")
-            print(
-                f"[Project][YOLO] Leader spacing unavailable: {_yolo_load_error}",
-                flush=True,
-            )
-            _detection_agent = None
-    except Exception as e:
-        _detection_agent = None
-        _yolo_load_error = str(e)
-        print(f"[Project][YOLO] Leader spacing unavailable ({e}).", flush=True)
-    return _detection_agent
-
-
-def _log_yolo_ready_if_needed(det_agent) -> None:
-    global _yolo_load_error, _yolo_ready_logged
-    if det_agent is None or not det_agent.model_loaded or _yolo_ready_logged:
-        return
-    _yolo_ready_logged = True
-    _yolo_load_error = None
-    print(
-        f"[Project][YOLO] Leader spacing model ready "
-        f"(img_size={det_agent.img_size}).",
-        flush=True,
-    )
-
-
-def _leader_truck_in_roi(
-    bbox: Tuple[int, int, int, int],
-    frame_shape: Tuple[int, int],
-    cfg: Dict[str, Any],
-) -> bool:
-    h, w = frame_shape
-    x1, y1, x2, y2 = bbox
-    area = (x2 - x1) * (y2 - y1)
-    if area < int(cfg.get("leader_min_bbox_area", 400)):
-        return False
-    if y2 / max(1.0, float(h)) < float(cfg.get("leader_min_y2_frac", 0.25)):
-        return False
-
-    roi = max(0.2, min(1.0, float(cfg.get("leader_center_roi", 0.65))))
-    margin = (1.0 - roi) * 0.5
-    cx = 0.5 * (x1 + x2)
-    return margin * w <= cx <= (1.0 - margin) * w
-
-
-def _leader_truck_distance_signal(
-    bbox: Tuple[int, int, int, int],
-    frame_shape: Tuple[int, int],
-) -> float:
-    """Monocular proximity: larger + lower in frame => closer."""
-    h, w = frame_shape
-    x1, y1, x2, y2 = bbox
-    area_norm = ((x2 - x1) * (y2 - y1)) / max(1.0, float(w * h))
-    y2_frac = y2 / max(1.0, float(h))
-    return 0.65 * area_norm + 0.35 * y2_frac
-
-
-def fetch_yolo_detections(frame_bgr, cfg: Dict[str, Any]) -> list:
-    """Run YOLO at most ~status_poll_hz; shared by follower spacing and MJPEG preview."""
-    global _yolo_detect_cache_ts, _yolo_detect_cache_dets, _yolo_load_error
+def get_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]) -> Optional[GridDetection]:
+    """Shared grid detect + cache for MJPEG preview."""
     if frame_bgr is None:
-        return []
-    if str(cfg.get("role", "leader")).lower() != "follower":
-        return []
-    if not cfg.get("leader_yolo_enabled", True):
-        return []
-
-    _get_detection_agent()
-
-    min_dt = 1.0 / max(1.0, float(cfg.get("status_poll_hz", 10)))
-    now = time.time()
-    with _yolo_detect_cache_lock:
-        if now - _yolo_detect_cache_ts < min_dt:
-            return list(_yolo_detect_cache_dets)
-
-        det_agent = _get_detection_agent()
-        if det_agent is None or not det_agent.model_loaded:
-            return list(_yolo_detect_cache_dets)
-
-        _log_yolo_ready_if_needed(det_agent)
-        try:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            detections = list(det_agent.detect(frame_rgb))
-            _yolo_detect_cache_dets = detections
-            _yolo_detect_cache_ts = time.time()
-            return detections
-        except Exception as e:
-            print(f"[Project][YOLO] detect failed: {e}")
-            return list(_yolo_detect_cache_dets)
+        return get_cached_grid_detection()
+    return fetch_leader_grid(frame_bgr, cfg)
 
 
-def get_yolo_preview_detections() -> list:
-    """Latest cached YOLO boxes for UI overlay (follower preview)."""
-    with _yolo_detect_cache_lock:
-        return list(_yolo_detect_cache_dets)
-
-
-def estimate_leader_distance_from_yolo(
-    frame_bgr,
-    cfg: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[float]]:
-    """Pick the best in-lane truck box as the leader; return (distance_signal, confidence)."""
-    if frame_bgr is None:
-        return None, None
-
-    detections = fetch_yolo_detections(frame_bgr, cfg)
-    if not detections:
-        return None, None
-
-    leader_cls = int(cfg.get("leader_class_id", LEADER_YOLO_CLASS_ID))
-    frame_shape = frame_bgr.shape[:2]
-    best_signal = None
-    best_score = None
-    for bbox, conf, cls_id in detections:
-        if int(cls_id) != leader_cls:
-            continue
-        if not _leader_truck_in_roi(bbox, frame_shape, cfg):
-            continue
-        signal = _leader_truck_distance_signal(bbox, frame_shape)
-        if best_signal is None or signal > best_signal:
-            best_signal = signal
-            best_score = float(conf)
-
-    return best_signal, best_score
-
-
-def estimate_follower_distance_signal(
-    frame_bgr,
-    cfg: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[float]]:
-    """YOLO truck box spacing when enabled; otherwise HTTP-only (no distance signal)."""
-    if not cfg.get("leader_yolo_enabled", True):
-        return None, None
-    return estimate_leader_distance_from_yolo(frame_bgr, cfg)
+def render_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]):
+    det = get_follower_grid_overlay(frame_bgr, cfg)
+    if det is None or not det.found:
+        return frame_bgr
+    return draw_grid_overlay(frame_bgr, det)
 
 
 def set_lane_agent(lane_agent: LaneServoingAgent) -> None:
@@ -1439,17 +1282,17 @@ def _apply_lane_wheels(
     speed_cap: float,
     use_direct_pwm: bool,
 ) -> None:
-    """Drive from lane agent: direct PWM (lane task) or scaled to speed_cap (convoy cap)."""
+    """Drive from lane agent PWM, always capped by speed_cap (preserves steer ratio)."""
     if wheels is None:
         return
-    if use_direct_pwm:
-        wheels.set_wheels_speed(min(1.0, float(left)), min(1.0, float(right)))
-        return
-    peak = max(1e-6, max(float(left), float(right)))
-    scale = max(0.0, float(speed_cap)) / peak
+    left_f = float(left)
+    right_f = float(right)
+    peak = max(1e-6, max(abs(left_f), abs(right_f)))
+    cap = max(0.0, float(speed_cap))
+    scale = cap / peak
     wheels.set_wheels_speed(
-        min(1.0, float(left) * scale),
-        min(1.0, float(right) * scale),
+        min(1.0, left_f * scale),
+        min(1.0, right_f * scale),
     )
 
 
@@ -1459,9 +1302,37 @@ def _sleep_if_no_frame(frame_bgr) -> None:
         time.sleep(0.01)
 
 
+def _drive_follower(
+    wheels,
+    lane_agent,
+    frame_bgr,
+    commanded_speed,
+    target_speed,
+    frame_dt,
+    cfg,
+    wheel_pwm=None,
+) -> float:
+    """Ramp to spacing target, then lane steer or intersection arc PWM."""
+    commanded_speed = _ramp_toward(
+        commanded_speed, target_speed, _speed_ramp_delta(cfg, frame_dt),
+    )
+    if wheel_pwm is not None:
+        left_pwm, right_pwm = wheel_pwm
+    elif frame_bgr is not None:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        left_pwm, right_pwm = lane_agent.compute_commands(frame_rgb)
+    else:
+        left_pwm, right_pwm = commanded_speed, commanded_speed
+
+    if wheels is not None and is_driving_enabled():
+        _apply_lane_wheels(wheels, left_pwm, right_pwm, commanded_speed, False)
+        _remember_lane_pwm(lane_agent, left_pwm, right_pwm)
+    elif wheels is not None:
+        _safe_stop(wheels)
+    return commanded_speed
+
+
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
-    status_hz = max(1.0, float(cfg.get("status_publish_hz", 10)))
-    status_dt = 1.0 / status_hz
     cruise_speed = float(cfg.get("cruise_speed", 0.4))
     slow_speed = float(cfg.get("slow_speed", 0.15))
     stop_hold_s = float(cfg.get("stop_hold_s", 2.0))
@@ -1482,7 +1353,6 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         print("[Project][Leader] Lane PWM: scaled to cruise_speed / slow_speed.")
  
     last_log = 0.0
-    last_status_pub = 0.0
     last_drive_ts = time.time()
     state = STATE_CRUISING
     current_speed = cruise_speed
@@ -1602,25 +1472,19 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             elif wheels is not None:
                 _safe_stop(wheels)
 
-        if now - last_status_pub >= status_dt:
-            payload = build_status_payload(state, current_speed)
-            payload.update(
-                {
-                    "event": last_event,
-                    "tag_ids": last_tag_ids,
-                    "manual_command": get_manual_convoy_command(),
-                    "sign_source": sign_source,
-                }
-            )
-            set_leader_status(payload)
-            last_status_pub = now
- 
         if now - last_log >= 2.0:
             print(
                 f"[Project][Leader] state={state} speed={current_speed:.2f} "
                 f"event={last_event} tags={last_tag_ids}"
             )
             last_log = now
+
+        _update_convoy_ui_status(
+            state=state,
+            speed=current_speed,
+            event=last_event,
+            tag_ids=list(last_tag_ids),
+        )
 
         _apply_convoy_leds(
             leds,
@@ -1632,47 +1496,53 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         )
         _sleep_if_no_frame(frame_bgr)
  
-    set_leader_status(build_status_payload(STATE_STOPPED, 0.0))
+    _update_convoy_ui_status(
+        state=STATE_STOPPED,
+        speed=0.0,
+        event=EVENT_NORMAL,
+        tag_ids=[],
+    )
     _safe_stop(wheels)
     _convoy_leds_off(leds)
     print("[Project][Leader] Stopped.")
  
  
 def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
-    poll_hz = max(1.0, float(cfg.get("status_poll_hz", 10)))
-    poll_dt = 1.0 / poll_hz
-    request_timeout_s = float(cfg.get("request_timeout_s", 0.2))
-    leader_timeout_s = float(cfg.get("leader_timeout_s", 0.4))
-    leader_host = str(cfg.get("leader_host", "127.0.0.1")).strip()
-    leader_port = int(cfg.get("leader_port", 5055))
+    grid_hz = max(1.0, float(cfg.get("grid_detect_hz", 10)))
+    grid_dt = 1.0 / grid_hz
     cruise_speed = float(cfg.get("cruise_speed", 0.4))
     slow_speed = float(cfg.get("slow_speed", 0.15))
-    follower_max_speed = float(cfg.get("follower_max_speed", 0.4))
-    follower_min_speed = float(cfg.get("follower_min_speed", 0.0))
-    distance_target = float(cfg.get("distance_target", 0.06))
-    distance_kp = float(cfg.get("distance_kp", 0.6))
-    decel_time_s = float(cfg.get("decel_time_s", 1.2))
-    decel_steps = int(cfg.get("decel_steps", 10))
-    status_url = f"http://{leader_host}:{leader_port}/convoy/status"
+    follower_max = float(cfg.get("follower_max_speed", 0.4))
+    follower_min = float(cfg.get("follower_min_speed", 0.0))
+    loss_confirm = max(1, int(cfg.get("leader_loss_confirm_frames", 3)))
+    red_confirm = max(1, int(cfg.get("intersection_red_confirm_frames", 3)))
+    span_target = float(cfg.get("span_target_px", 32.0))
     print("[Project][Follower] Lane control: one update per camera frame (like visual_lane_servoing).")
-    print(f"[Project][Follower] HTTP + YOLO spacing polled at {poll_hz:.1f} Hz.")
- 
+    print(
+        f"[Project][Follower] span_target={span_target:.0f}px; "
+        f"red-line intersection ({int(cfg.get('grid_cols', 7))}x{int(cfg.get('grid_rows', 3))} grid at {grid_hz:.1f} Hz).",
+        flush=True,
+    )
+
+    spacing = GridSpacingController()
+    turn_tracker = LeaderTurnTracker(window=int(cfg.get("intersection_turn_track_window", 20)))
     last_log = 0.0
-    last_poll = 0.0
-    last_yolo = 0.0
+    last_grid = 0.0
     last_drive_ts = time.time()
-    latest = build_status_payload(STATE_STOPPED, 0.0)
-    mode = EVENT_TIMEOUT
-    target_speed = 0.0
+    mode = STATE_CRUISING
     commanded_speed = 0.0
     prev_mode = None
+    leader_loss_streak = 0
+    leader_visible = False
     last_distance_signal = None
-    last_distance_meta = None
-    if bool(cfg.get("leader_yolo_enabled", True)):
-        print("[Project][Follower] Leader spacing: HTTP + YOLO truck.", flush=True)
-        _get_detection_agent()
-    else:
-        print("[Project][Follower] Leader spacing: HTTP only.", flush=True)
+    last_span_px = None
+    line_streak = 0
+    intersection_phase = None  # None | "TURN" | "RECOVERY"
+    intersection_direction = None
+    intersection_arc_end = 0.0
+    intersection_end = 0.0
+    recovery_streak = 0
+    recovery_started_at = 0.0
 
     while not stop_event.is_set():
         now = time.time()
@@ -1680,113 +1550,141 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         last_drive_ts = now
         frame_bgr, _ = _extract_frame_gray(camera)
 
-        distance_signal = last_distance_signal
-        if now - last_yolo >= poll_dt:
-            yolo_signal, distance_meta = estimate_follower_distance_signal(frame_bgr, cfg)
-            if yolo_signal is not None:
-                last_distance_signal = yolo_signal
-                distance_signal = yolo_signal
-            if distance_meta is not None:
-                last_distance_meta = distance_meta
-            last_yolo = now
+        red_prox = measure_red_at_line(frame_bgr, cfg)
+        turn_tracker.begin_approach_if_needed(red_prox, cfg)
 
-        if now - last_poll >= poll_dt:
-            try:
-                resp = requests.get(status_url, timeout=request_timeout_s)
-                if resp.ok:
-                    data = resp.json()
-                    latest = {
-                        "state": str(data.get("state", "STOPPED")).upper(),
-                        "speed": float(data.get("speed", 0.0)),
-                        "ts": float(data.get("ts", 0.0)),
-                        "event": str(data.get("event", EVENT_NORMAL)),
-                        "manual_command": str(data.get("manual_command", MANUAL_CRUISING)),
-                    }
-                    _update_follower_leader_mirror(latest)
-            except Exception:
-                pass
-            last_poll = now
- 
-        is_stale = (now - float(latest.get("ts", 0.0))) > leader_timeout_s
-        state = str(latest.get("state", "STOPPED")).upper()
-        leader_speed = max(0.0, float(latest.get("speed", 0.0)))
-        if is_stale:
-            mode, target_speed = EVENT_TIMEOUT, 0.0
-        elif state == STATE_STOPPED:
-            mode, target_speed = STATE_STOPPED, 0.0
-        elif state == STATE_SLOW:
-            mode, target_speed = STATE_SLOW, min(slow_speed, leader_speed, follower_max_speed)
-        else:
-            mode, target_speed = STATE_CRUISING, min(cruise_speed, leader_speed, follower_max_speed)
-
-        if mode in (STATE_CRUISING, STATE_SLOW) and distance_signal is not None:
-            # Smaller signal -> leader farther -> speed up; larger -> closer -> slow down.
-            distance_error = distance_target - float(distance_signal)
-            target_speed += distance_kp * distance_error
-            target_speed = max(follower_min_speed, min(follower_max_speed, target_speed))
-
-        if mode == EVENT_TIMEOUT:
-            commanded_speed = 0.0
-            _safe_stop(wheels)
-            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
-        elif mode == STATE_STOPPED:
-            _apply_convoy_leds(
-                leds,
-                state=STATE_STOPPING,
-                current_speed=commanded_speed,
-                cruise_speed=cruise_speed,
-                slow_speed=slow_speed,
-                driving_enabled=is_driving_enabled(),
-            )
-            if commanded_speed > 0.0 and is_driving_enabled():
-                smooth_stop(
-                    wheels, commanded_speed, decel_time_s, decel_steps, stop_event, _get_lane_agent()
-                )
+        if now - last_grid >= grid_dt:
+            grid_det = fetch_leader_grid(frame_bgr, cfg) if frame_bgr is not None else None
+            if grid_det is not None and grid_det.found:
+                leader_loss_streak = 0
+                leader_visible = True
+                last_distance_signal = grid_det.distance_signal
+                if grid_det.span_px is not None:
+                    last_span_px = float(grid_det.span_px)
+                    spacing.observe(last_span_px, now, cfg, commanded_speed)
+                if turn_tracker.approach_active:
+                    turn_tracker.update(grid_det)
             else:
-                _safe_stop(wheels)
-            commanded_speed = 0.0
-            _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
+                leader_loss_streak += 1
+                if leader_loss_streak >= loss_confirm:
+                    leader_visible = False
+            last_grid = now
+
+        if red_prox.at_line:
+            line_streak += 1
         else:
-            commanded_speed = _ramp_toward(
-                commanded_speed,
-                target_speed,
-                _speed_ramp_delta(cfg, frame_dt),
+            line_streak = 0
+
+        if (
+            intersection_phase is None
+            and line_streak >= red_confirm
+            and is_driving_enabled()
+        ):
+            drift, cx_vote, heading_vote = turn_tracker.debug_votes(cfg)
+            intersection_direction = turn_tracker.infer(cfg)
+            intersection_phase = "TURN"
+            arc_s = intersection_turn_duration(intersection_direction, cfg)
+            tail_s = max(0.0, float(cfg.get("intersection_turn_tail_straight_s", 1.6)))
+            intersection_arc_end = now + arc_s
+            intersection_end = now + arc_s + tail_s
+            recovery_streak = 0
+            print(
+                f"[Project][Follower] Red line — turn {intersection_direction} "
+                f"(cx_drift={drift:.0f}px cx={cx_vote} heading={heading_vote}; "
+                f"near_px={red_prox.near_px}) arc={arc_s:.1f}s tail={tail_s:.1f}s",
+                flush=True,
             )
-            if wheels is not None and frame_bgr is not None:
-                lane_agent = _get_lane_agent()
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                left, right = lane_agent.compute_commands(frame_rgb)
-                _remember_lane_pwm(lane_agent, left, right)
-                # Follower always scales to commanded_speed (leader HTTP + YOLO spacing).
-                _maybe_drive_wheels(wheels, left, right, commanded_speed, use_direct_pwm=False)
-            elif wheels is not None and is_driving_enabled():
-                wheels.set_wheels_speed(commanded_speed, commanded_speed)
-            elif wheels is not None:
-                _safe_stop(wheels)
+
+        lane_agent = _get_lane_agent()
+        target_speed = spacing.compute_target_speed(cfg, follower_min, follower_max)
+        wheel_pwm = None
+        follow_mode = "cruise"
+
+        if intersection_phase == "TURN":
+            mode = STATE_INTERSECTION
+            in_tail = now >= intersection_arc_end
+            drive_dir = "straight" if in_tail else intersection_direction
+            wheel_pwm = intersection_wheel_commands(drive_dir, cfg)
+            follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
+            if now >= intersection_end:
+                intersection_phase = "RECOVERY"
+                recovery_streak = 0
+                recovery_started_at = now
+                print("[Project][Follower] Turn done — lane recovery", flush=True)
+        elif intersection_phase == "RECOVERY":
+            mode = STATE_INTERSECTION
+            follow_mode = "recovery"
+            recovery_min_s = float(cfg.get("intersection_recovery_min_s", 2.8))
+            require_clear_red = bool(cfg.get("intersection_recovery_require_clear_red", True))
+            if (now - recovery_started_at) >= recovery_min_s:
+                red_clear = (not red_prox.at_line) if require_clear_red else True
+                if red_clear and lane_frame_ok_for_recovery(lane_agent, cfg):
+                    recovery_streak += 1
+                else:
+                    recovery_streak = 0
+            if recovery_streak >= max(1, int(cfg.get("intersection_recovery_lane_frames", 20))):
+                intersection_phase = None
+                line_streak = 0
+                turn_tracker.reset()
+                recovery_streak = 0
+                print("[Project][Follower] Lane recovered — resume cruise", flush=True)
+        else:
+            mode = STATE_CRUISING
+            follow_mode = "convoy" if leader_visible else "lane"
+
+        commanded_speed = _drive_follower(
+            wheels, lane_agent, frame_bgr, commanded_speed, target_speed, frame_dt, cfg, wheel_pwm,
+        )
 
         if mode != prev_mode:
             print(f"[Project][Follower] transition {prev_mode} -> {mode}")
             prev_mode = mode
 
+        _update_convoy_ui_status(
+            state=mode,
+            speed=commanded_speed,
+            event=EVENT_NORMAL if leader_visible else EVENT_LEADER_LOST,
+            dist_signal=last_distance_signal if leader_visible else None,
+            leader_visible=leader_visible,
+            follow_mode=follow_mode,
+            intersection_phase=intersection_phase or "-",
+            intersection_turn=intersection_direction or "-",
+            red_near_px=red_prox.near_px,
+            red_at_line=red_prox.at_line,
+            tag_ids=[],
+        )
+
         if now - last_log >= 2.0:
-            age = now - float(latest.get("ts", 0.0))
+            dist_str = f"{last_distance_signal:.3f}" if last_distance_signal is not None else "-"
+            span_str = f"{last_span_px:.1f}" if last_span_px is not None else "-"
             print(
-                f"[Project][Follower] mode={mode} target_speed={target_speed:.2f} cmd={commanded_speed:.2f} "
-                f"leader_state={state} leader_speed={leader_speed:.2f} age={age:.2f}s "
-                f"dist_signal={distance_signal} dist_meta={last_distance_meta}"
+                f"[Project][Follower] mode={mode} follow={follow_mode} "
+                f"target={target_speed:.2f} cmd={commanded_speed:.2f} "
+                f"span={span_str}/{span_target:.0f} span_dot={spacing.span_dot:.1f} "
+                f"v_leader={spacing.v_leader_est:.2f} dist={dist_str} "
+                f"leader={leader_visible} red={red_prox.near_px} at_line={red_prox.at_line} "
+                f"intersection={intersection_phase} turn={intersection_direction}"
             )
             last_log = now
 
         _apply_convoy_leds(
             leds,
-            state=mode if mode != EVENT_TIMEOUT else STATE_STOPPED,
+            state=mode,
             current_speed=commanded_speed,
             cruise_speed=cruise_speed,
             slow_speed=slow_speed,
             driving_enabled=is_driving_enabled(),
         )
         _sleep_if_no_frame(frame_bgr)
- 
+
+    _update_convoy_ui_status(
+        state=STATE_STOPPED,
+        speed=0.0,
+        event=EVENT_LEADER_LOST,
+        dist_signal=None,
+        leader_visible=False,
+        tag_ids=[],
+    )
     _safe_stop(wheels)
     _convoy_leds_off(leds)
     print("[Project][Follower] Stopped.")

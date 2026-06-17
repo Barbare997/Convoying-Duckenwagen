@@ -157,11 +157,11 @@ func _process(_delta: float) -> void:
 				right_cmd = float(d.get("right", 0.0))
 
 		elif msg_type == "reset":
-			# Reset game - WheelServer is a direct child of the robot node
 			var robot = get_parent()
 			if robot and robot.has_method("reset_game"):
 				robot.reset_game()
 				game_over = false
+				get_tree().call_group("npc_leader", "reset_leader")
 				print("[WheelServer] Game reset by Python")
 
 		elif msg_type == "remove_objects":
@@ -210,6 +210,13 @@ func _send_state() -> void:
 			"distance_traveled": final_distance_traveled,
 			"distance_from_start": final_distance_from_start
 		}
+
+	var npcs := get_tree().get_nodes_in_group("npc_leader")
+	if npcs.size() > 0:
+		var npc := npcs[0] as Node3D
+		if npc != null:
+			state["npc_x"] = npc.global_position.x
+			state["npc_z"] = npc.global_position.z
 
 	state["type"] = "state"
 

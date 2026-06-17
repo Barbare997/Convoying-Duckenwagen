@@ -75,16 +75,6 @@ except Exception as e:
 
 try:
 
-    from servers.object_detection.visualization import draw_detections
-
-except ModuleNotFoundError:
-
-    draw_detections = None
-
-
-
-try:
-
     from servers.templates.project import get_template
 
 except ModuleNotFoundError:
@@ -210,19 +200,22 @@ def _refresh_display_masks(frame_bgr):
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     try:
-        mask_left, mask_right = _lane_activity.detect_lane_markings(frame_bgr)
+        mask_y, mask_w, mask_r = _lane_activity.detect_lane_markings(frame_bgr)
     except Exception as e:
         print(f'[Project] detect_lane_markings error: {e}')
         return
 
-    mask_y = (mask_left * 255).astype(np.uint8)
-    mask_w = (mask_right * 255).astype(np.uint8)
-    combined = np.clip(mask_left + mask_right, 0, 1)
-    h, w = mask_y.shape
-    yellow_xs, white_xs = detect_lines_in_slices(mask_left, mask_right, h)
+    mask_y_u8 = (mask_y * 255).astype(np.uint8)
+    mask_r_u8 = (mask_r * 255).astype(np.uint8)
+    mask_w_u8 = (mask_w * 255).astype(np.uint8)
+    mask_left = np.clip(mask_y + mask_r, 0, 1)
+    combined = np.clip(mask_left + mask_w, 0, 1)
+    h, w = mask_y_u8.shape
+    mask_left_u8 = (mask_left * 255).astype(np.uint8)
+    yellow_xs, white_xs, red_xs = detect_lines_in_slices(mask_left_u8, mask_w_u8, h, mask_r_u8)
     slice_height = int(h * 0.35 / _NUM_SLICES)
     start_y = int(h * _ROI_START)
-    total_pixels = int(np.count_nonzero(mask_y) + np.count_nonzero(mask_w))
+    total_pixels = int(np.count_nonzero(mask_y_u8) + np.count_nonzero(mask_r_u8) + np.count_nonzero(mask_w_u8))
 
     with _debug_lock:
         debug = dict(_lane_agent.last_debug_info or _lane_agent._empty_debug_info(h, w))
@@ -230,31 +223,30 @@ def _refresh_display_masks(frame_bgr):
             'frame_bgr': frame_bgr,
             'roi': frame_rgb,
             'lane_mask': (combined * 255).astype(np.uint8),
-            'white_mask': mask_w,
-            'yellow_mask': mask_y,
+            'white_mask': mask_w_u8,
+            'yellow_mask': mask_y_u8,
+            'red_mask': mask_r_u8,
             'total_lane_pixels': total_pixels,
             'lane_detected': total_pixels >= _lane_agent.detection_threshold,
             'yellow_xs': yellow_xs,
             'white_xs': white_xs,
+            'red_xs': red_xs,
             'slice_ys': [start_y + i * slice_height + slice_height // 2 for i in range(_NUM_SLICES)],
         })
         _lane_agent.last_debug_info = debug
 
 
-def _apply_follower_yolo_overlay(frame_bgr):
-    """Draw all YOLO boxes on the camera panel (follower only, whenever model is loaded)."""
-    if frame_bgr is None or draw_detections is None:
+def _apply_follower_grid_overlay(frame_bgr):
+    """Draw circle-grid dots on the camera panel (follower only)."""
+    if frame_bgr is None:
         return frame_bgr
     try:
         cfg = agent.load_config()
         if str(cfg.get("role", "leader")).lower() != "follower":
             return frame_bgr
-        detections = agent.fetch_yolo_detections(frame_bgr, cfg)
-        if not detections:
-            return frame_bgr
-        return draw_detections(frame_bgr.copy(), detections)
+        return agent.render_follower_grid_overlay(frame_bgr, cfg)
     except Exception as e:
-        print(f'[Project] YOLO overlay error: {e}')
+        print(f'[Project] Grid overlay error: {e}')
         return frame_bgr
 
 
@@ -268,7 +260,7 @@ def _visualize(frame_bgr):
     if _direct_camera_fallback:
         _feed_convoy_frame(frame_bgr)
 
-    display_bgr = _apply_follower_yolo_overlay(frame_bgr)
+    display_bgr = _apply_follower_grid_overlay(frame_bgr)
 
     if _lane_agent is None or create_lane_visualization is None:
         return display_bgr
@@ -521,16 +513,6 @@ def shutdown():
 
 
 
-@app.route('/convoy/status')
-
-def convoy_status():
-
-    return jsonify(agent.get_leader_status())
-
-
-
-
-
 @app.route('/convoy/manual', methods=['POST'])
 
 def convoy_manual():
@@ -569,7 +551,7 @@ def status():
 
     cfg = agent.load_config()
 
-    payload = agent.get_leader_status()
+    payload = agent.get_convoy_ui_status()
 
     payload['role'] = cfg.get('role', 'leader')
 
@@ -610,6 +592,10 @@ def update_hsv():
         [current['white_lower_h'],  current['white_lower_s'],  current['white_lower_v']],
 
         [current['white_upper_h'],  current['white_upper_s'],  current['white_upper_v']],
+
+        [current['red_lower_h'], current['red_lower_s'], current['red_lower_v']],
+
+        [current['red_upper_h'], current['red_upper_s'], current['red_upper_v']],
 
     )
 

@@ -10,6 +10,7 @@ import tempfile
 import platform
 import zipfile
 import stat
+import time
 from pathlib import Path
 
 import requests
@@ -321,6 +322,37 @@ def _bot_host(target):
     return target if target.replace('.', '').isdigit() else f"{target}.local"
 
 
+def _add_tar_file(tar, rel_path, filter_fn, arcname=None):
+    path = os.path.join(PROJECT_ROOT, rel_path)
+    if not os.path.isfile(path):
+        return False
+    arc = arcname or rel_path.replace('\\', '/')
+    print(f"   Adding dependency: {arc}")
+    tar.add(path, arcname=arc, filter=filter_fn)
+    return True
+
+
+def _add_hw_server_deps(tar, filter_fn):
+    """Shared modules imported by servers/*/real_server.py on the bot."""
+    _add_tar_file(tar, 'servers/common.py', filter_fn)
+    for rel in ('__init__.py', 'config.py', 'ports.py'):
+        _add_tar_file(tar, f'launcher/{rel}', filter_fn)
+
+
+def _wait_for_task_health(host, port, timeout=20):
+    url = f"http://{host}:{port}/health"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(url, timeout=2)
+            if response.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def package_task(task_name):
     print(f"Packaging task: {task_name}")
     task_packages_dir = os.path.join(PROJECT_ROOT, 'tasks', task_name, 'packages')
@@ -351,6 +383,10 @@ def package_task(task_name):
         if os.path.exists(task_server_dir):
             print(f"   Adding server: servers/{task_name}/")
             tar.add(task_server_dir, arcname=f'servers/{task_name}', filter=no_pycache)
+            real_server = os.path.join(task_server_dir, 'real_server.py')
+            if os.path.isfile(real_server):
+                print("   Adding hardware server dependencies...")
+                _add_hw_server_deps(tar, no_pycache)
         if task_name == 'visual_lane_servoing':
             templates_dir = os.path.join(PROJECT_ROOT, 'servers', 'templates')
             if os.path.exists(templates_dir):
@@ -359,8 +395,6 @@ def package_task(task_name):
 
         if task_name == 'project':
             for dep in (
-                ('object_detection', 'packages'),
-                ('object_detection', 'models'),
                 ('visual_lane_servoing', 'packages'),
             ):
                 dep_path = os.path.join(PROJECT_ROOT, 'tasks', dep[0], dep[1])
@@ -379,13 +413,6 @@ def package_task(task_name):
                     arc = f'servers/visual_lane_servoing/{rel}'
                     print(f"   Adding dependency: {arc}")
                     tar.add(vls_file, arcname=arc, filter=no_pycache)
-            od_dir = os.path.join(PROJECT_ROOT, 'servers', 'object_detection')
-            for rel in ('__init__.py', 'visualization.py'):
-                od_file = os.path.join(od_dir, rel)
-                if os.path.isfile(od_file):
-                    arc = f'servers/object_detection/{rel}'
-                    print(f"   Adding dependency: {arc}")
-                    tar.add(od_file, arcname=arc, filter=no_pycache)
 
     buf.seek(0)
     print("Package created!")
@@ -429,16 +456,23 @@ def start_task_on_bot(bot_target, task_name, task_port, deploy_port, debug=False
                                  timeout=10)
         if response.status_code == 200:
             result = response.json()
+            actual_port = result.get('port', task_port)
             print(f"Task started!")
             print(f"   PID: {result.get('pid')}")
-            print(f"   Port: {result.get('port')}")
-            print(f"   Web UI: http://{host}:{result.get('port')}")
-            return True
+            print(f"   Port: {actual_port}")
+            print(f"   Web UI: http://{host}:{actual_port}")
+            print("\n[3/3] Waiting for web server...")
+            if _wait_for_task_health(host, actual_port):
+                print("   Web server is responding.")
+                return actual_port
+            print(f"   Warning: no response from http://{host}:{actual_port}/health")
+            print("   The task may have crashed — check logs on the bot dashboard.")
+            return actual_port
         print(f"Failed to start task: {response.status_code}\n   {response.text}")
-        return False
+        return None
     except Exception as e:
         print(f"Error: {e}")
-        return False
+        return None
 
 
 def stop_task_on_bot(bot_target, deploy_port):
@@ -487,10 +521,11 @@ def run_on_bot(args):
     print("Deployment complete!")
 
     print("\n[2/3] Starting task...")
-    if start_task_on_bot(bot_target, task_name, task_port, deploy_port, debug=args.debug):
+    actual_port = start_task_on_bot(bot_target, task_name, task_port, deploy_port, debug=args.debug)
+    if actual_port:
         host = _bot_host(bot_target)
         print(f"\nTask '{task_name}' is running!")
-        print(f"   Web UI: http://{host}:{task_port}")
+        print(f"   Web UI: http://{host}:{actual_port}")
         return 0
     return 1
 

@@ -284,26 +284,43 @@ def create_lane_visualization(
             dy = int(sy_list[i] * scale_y)
             dx = int(x * scale_x)
             cv2.circle(cam, (dx, dy), 5, (255, 255, 255), -1)  # white dot = white line
- 
+
+    for i, x in enumerate(debug_info.get('red_xs', [])):
+        sy_list = debug_info.get('slice_ys', [])
+        if i < len(sy_list):
+            dy = int(sy_list[i] * scale_y)
+            dx = int(x * scale_x)
+            cv2.circle(cam, (dx, dy), 5, (0, 0, 255), -1)  # red dot = red line
+
     # Panel 2 – combined lane heatmap
     lane_vis  = cv2.resize(cv2.applyColorMap(debug_info['lane_mask'],  cv2.COLORMAP_HOT),  (display_w, display_h))
     white_vis = cv2.resize(cv2.applyColorMap(debug_info['white_mask'], cv2.COLORMAP_BONE), (display_w, display_h))
-    # Yellow mask: yellow on black background
     ym = debug_info['yellow_mask']
     yellow_bgr = np.zeros((*ym.shape, 3), dtype=np.uint8)
-    yellow_bgr[:, :, 1] = ym  # green channel
-    yellow_bgr[:, :, 2] = ym  # red channel  (green + red = yellow in BGR)
+    yellow_bgr[:, :, 1] = ym
+    yellow_bgr[:, :, 2] = ym
     yellow_vis = cv2.resize(yellow_bgr, (display_w, display_h))
- 
-    grid = np.vstack([np.hstack([cam, lane_vis]),
-                      np.hstack([white_vis, yellow_vis])])
- 
+
+    rm = debug_info.get('red_mask')
+    if rm is None:
+        rm = np.zeros_like(ym)
+    red_bgr = np.zeros((*rm.shape, 3), dtype=np.uint8)
+    red_bgr[:, :, 2] = rm
+    red_vis = cv2.resize(red_bgr, (display_w * 2, display_h))
+
+    grid = np.vstack([
+        np.hstack([cam, lane_vis]),
+        np.hstack([white_vis, yellow_vis]),
+        red_vis,
+    ])
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     green = (0, 255, 0)
     cv2.putText(grid, "Camera",       (10,              20), font, 0.5, green, 1)
     cv2.putText(grid, "Lane Mask",    (display_w + 10,  20), font, 0.5, green, 1)
     cv2.putText(grid, "White Lines",  (10,              display_h + 20), font, 0.5, green, 1)
     cv2.putText(grid, "Yellow Lines", (display_w + 10,  display_h + 20), font, 0.5, green, 1)
+    cv2.putText(grid, "Red Lines",    (10,              2 * display_h + 20), font, 0.5, green, 1)
  
     info = _info_strip(display_w * 2, debug_info, pwm_left, pwm_right)
     return np.vstack([grid, info])

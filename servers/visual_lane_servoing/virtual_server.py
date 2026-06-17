@@ -138,8 +138,10 @@ def update_hsv():
     mod.set_hsv_bounds(
         [current['yellow_lower_h'], current['yellow_lower_s'], current['yellow_lower_v']],
         [current['yellow_upper_h'], current['yellow_upper_s'], current['yellow_upper_v']],
-        [current['white_lower_h'],  current['white_lower_s'],  current['white_lower_v']],
-        [current['white_upper_h'],  current['white_upper_s'],  current['white_upper_v']],
+        [current['white_lower_h'], current['white_lower_s'], current['white_lower_v']],
+        [current['white_upper_h'], current['white_upper_s'], current['white_upper_v']],
+        [current['red_lower_h'], current['red_lower_s'], current['red_lower_v']],
+        [current['red_upper_h'], current['red_upper_s'], current['red_upper_v']],
     )
     try:
         with open(LANE_HSV_CONFIG_FILE, 'w') as f:

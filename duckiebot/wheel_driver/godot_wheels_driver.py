@@ -39,6 +39,8 @@ class GameState:
     distance_traveled: float = 0.0
     distance_from_start: float = 0.0
     collision_duck: str = ""
+    npc_x: Optional[float] = None
+    npc_z: Optional[float] = None
 
 
 class GodotWheelTransport:
@@ -154,9 +156,11 @@ class GodotWheelTransport:
                 self.game_state = GameState(
                     game_over=bool(msg.get("game_over", False)),
                     survival_time=float(msg.get("survival_time", 0)),
-                    distance_traveled=float(msg.get("total_distance", 0)),
+                    distance_traveled=float(msg.get("total_distance", msg.get("distance_traveled", 0))),
                     distance_from_start=float(msg.get("distance_from_start", 0)),
                     collision_duck=str(msg.get("collision_duck", "")),
+                    npc_x=msg.get("npc_x"),
+                    npc_z=msg.get("npc_z"),
                 )
 
         except Exception as e:
@@ -233,6 +237,10 @@ class GodotWheelTransport:
         self._check_incoming()
         return self.game_state.game_over
 
+    def clear_state(self) -> None:
+        self._check_incoming()
+        self.game_state = GameState()
+
 
 class GodotWheelsDriver(WheelsDriverAbs):
     """Behaves like DaguWheelsDriver but sends executed PWM to Godot."""
@@ -282,6 +290,10 @@ class GodotWheelsDriver(WheelsDriverAbs):
     def is_game_over(self) -> bool:
         """Check if game is over (duck collision)."""
         return self.transport.is_game_over()
+
+    def clear_state(self) -> None:
+        """Forget pose/game state after a sim reset."""
+        self.transport.clear_state()
 
     def reset_game(self) -> None:
         self.transport.send_reset()

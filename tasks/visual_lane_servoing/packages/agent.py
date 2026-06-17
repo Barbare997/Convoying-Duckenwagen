@@ -13,7 +13,7 @@ _CONFIG_FILE = os.path.normpath(os.path.join(
 ))
 
 _LINE_OFFSET = 160
-_ROI_START   = 0.38
+_ROI_START   = 0.45
 _NUM_SLICES  = 3
 _SLICE_TOL   = 5
 # Small nudge toward lane center (keep symmetric — large white bias caused false right steer).
@@ -40,11 +40,12 @@ def detect_lines_in_slices(
     mask_yellow: np.ndarray,
     mask_white:  np.ndarray,
     h: int,
-) -> Tuple[list, list]:
+    mask_red: np.ndarray = None,
+) -> Tuple[list, list, list]:
     w = mask_yellow.shape[1]
     slice_height = int(h * 0.35 / _NUM_SLICES)
     start_y      = int(h * _ROI_START)
-    yellow_xs, white_xs = [], []
+    yellow_xs, white_xs, red_xs = [], [], []
 
     for i in range(_NUM_SLICES):
         y = start_y + i * slice_height + slice_height // 2
@@ -53,7 +54,6 @@ def detect_lines_in_slices(
         strip_y = mask_yellow[y - _SLICE_TOL: y + _SLICE_TOL, :]
         idx = _largest_component_cols(strip_y)
         if len(idx) > 0:
-            # 90th %ile ≈ inner edge on dashed yellow; max alone sits left of visible paint.
             y_edge = int(np.percentile(idx, 90))
             y_inset = int(_YELLOW_CENTER_BIAS_PX + far_frac * _YELLOW_FAR_SLICE_BIAS_PX)
             yellow_xs.append(min(w - 1, y_edge + y_inset))
@@ -63,7 +63,15 @@ def detect_lines_in_slices(
         if len(idx) > 0:
             white_xs.append(max(0, int(np.min(idx)) - _WHITE_CENTER_BIAS_PX))
 
-    return yellow_xs, white_xs
+        if mask_red is not None:
+            strip_r = mask_red[y - _SLICE_TOL: y + _SLICE_TOL, :]
+            idx = _largest_component_cols(strip_r)
+            if len(idx) > 0:
+                r_edge = int(np.percentile(idx, 90))
+                r_inset = int(_YELLOW_CENTER_BIAS_PX + far_frac * _YELLOW_FAR_SLICE_BIAS_PX)
+                red_xs.append(min(w - 1, r_edge + r_inset))
+
+    return yellow_xs, white_xs, red_xs
 
 
 class LaneServoingAgent:
@@ -164,39 +172,44 @@ class LaneServoingAgent:
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
         try:
-            mask_left, mask_right = student.detect_lane_markings(bgr)
+            mask_y, mask_w, mask_r = student.detect_lane_markings(bgr)
         except Exception as e:
             print(f"[Agent] detect_lane_markings error: {e}")
             return 0.0, 0.0
 
-        mask_y = (mask_left  * 255).astype(np.uint8)
-        mask_w = (mask_right * 255).astype(np.uint8)
+        mask_left = np.clip(mask_y + mask_r, 0, 1)
+        mask_y_vis = (mask_y * 255).astype(np.uint8)
+        mask_r_vis = (mask_r * 255).astype(np.uint8)
+        mask_w = (mask_w * 255).astype(np.uint8)
 
-        yellow_pixels = int(np.count_nonzero(mask_y))
+        yellow_pixels = int(np.count_nonzero(mask_y_vis))
+        red_pixels = int(np.count_nonzero(mask_r_vis))
         white_pixels  = int(np.count_nonzero(mask_w))
-        total_pixels  = yellow_pixels + white_pixels
+        total_pixels  = yellow_pixels + red_pixels + white_pixels
 
-        combined = np.clip(mask_left + mask_right, 0, 1)
+        combined = np.clip(mask_left + (mask_w // 255), 0, 1)
         self.last_debug_info = {
             'roi':               image,
             'frame_bgr':         bgr,
             'lane_mask':         (combined * 255).astype(np.uint8),
             'white_mask':        mask_w,
-            'yellow_mask':       mask_y,
+            'yellow_mask':       mask_y_vis,
+            'red_mask':          mask_r_vis,
             'total_lane_pixels': total_pixels,
             'lateral_error':     float(np.clip(self._prev_error, -1.0, 1.0)),
             'lane_detected':     total_pixels >= self.detection_threshold,
             'frame_count':       self.frame_count,
         }
 
-        h, w      = mask_y.shape
-        left_det  = yellow_pixels > 0
+        h, w      = mask_y_vis.shape
+        left_det  = (yellow_pixels + red_pixels) > 0
         right_det = white_pixels  > 0
         recovery  = total_pixels  < self.detection_threshold
 
-        yellow_xs, white_xs = detect_lines_in_slices(mask_y, mask_w, h)
+        mask_left_u8 = (mask_left * 255).astype(np.uint8)
+        yellow_xs, white_xs, red_xs = detect_lines_in_slices(mask_left_u8, mask_w, h, mask_r_vis)
         both_visible        = left_det and right_det and not recovery
-        is_curve, curve_dir = detect_curve(yellow_xs, white_xs, self.curve_threshold)
+        is_curve, curve_dir = detect_curve(yellow_xs, white_xs, self.curve_threshold, red_xs)
 
         raw_error            = self._calculate_error(yellow_xs, white_xs, left_det, right_det, w)
         self._filtered_error = 0.7 * self._filtered_error + 0.3 * raw_error
@@ -209,6 +222,7 @@ class LaneServoingAgent:
         self.last_debug_info.update({
             'yellow_xs': yellow_xs,
             'white_xs':  white_xs,
+            'red_xs':    red_xs,
             'slice_ys':  [start_y + i * slice_height + slice_height // 2 for i in range(_NUM_SLICES)],
             'is_curve':  is_curve,
             'curve_dir': curve_dir,
@@ -231,6 +245,7 @@ class LaneServoingAgent:
             'lane_mask':         np.zeros((h, w),    dtype=np.uint8),
             'white_mask':        np.zeros((h, w),    dtype=np.uint8),
             'yellow_mask':       np.zeros((h, w),    dtype=np.uint8),
+            'red_mask':          np.zeros((h, w),    dtype=np.uint8),
             'total_lane_pixels': 0,
             'lateral_error':     0.0,
             'lane_detected':     False,

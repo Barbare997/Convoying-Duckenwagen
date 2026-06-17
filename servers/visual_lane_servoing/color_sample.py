@@ -6,11 +6,13 @@ import cv2
 import numpy as np
 
 VIZ_PANEL_W = 320
+VIZ_GRID_ROWS = 3
 INFO_STRIP_H = 120
 
 # Tolerances for suggested HSV bounds around a clicked pixel.
 _YELLOW_TOL = (10, 60, 60)  # h, s, v
 _WHITE_TOL = (20, 50, 50)
+_RED_TOL = (10, 60, 60)
 
 
 def _display_h(frame_h: int, frame_w: int) -> int:
@@ -67,11 +69,11 @@ def _suggest_bounds(h: int, s: int, v: int, tol: Tuple[int, int, int]) -> Dict[s
 
 
 def _guess_line(fx: int, frame_w: int) -> str:
-    if fx < int(0.45 * frame_w):
+    if fx < int(0.40 * frame_w):
         return "yellow"
-    if fx > int(0.55 * frame_w):
+    if fx > int(0.60 * frame_w):
         return "white"
-    return "center"
+    return "red"
 
 
 def sample_pixel_from_frame_bgr(
@@ -105,6 +107,7 @@ def sample_pixel_from_frame_bgr(
         "line_guess": line_guess,
         "suggested_yellow": _suggest_bounds(h, s, v, _YELLOW_TOL),
         "suggested_white": _suggest_bounds(h, s, v, _WHITE_TOL),
+        "suggested_red": _suggest_bounds(h, s, v, _RED_TOL),
         "frame_size": {"width": frame_w, "height": frame_h},
         "camera_panel": {"width": VIZ_PANEL_W, "height": _display_h(frame_h, frame_w)},
     }
