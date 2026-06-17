@@ -82,6 +82,24 @@ _manual_convoy_cmd = MANUAL_CRUISING
 _manual_lock = threading.Lock()
 _manual_slow_until = 0.0
 
+_follower_reset_lock = threading.Lock()
+_follower_reset_pending = False
+
+
+def request_follower_runtime_reset():
+    """Clear follower spacing/intersection state (sim reset; agent thread keeps running)."""
+    global _follower_reset_pending
+    with _follower_reset_lock:
+        _follower_reset_pending = True
+
+
+def _take_follower_runtime_reset():
+    global _follower_reset_pending
+    with _follower_reset_lock:
+        pending = _follower_reset_pending
+        _follower_reset_pending = False
+    return pending
+
 
 def load_config() -> Dict[str, Any]:
     # Load only the fields needed by the skeleton. Missing file -> safe defaults.
@@ -1543,8 +1561,29 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     intersection_end = 0.0
     recovery_streak = 0
     recovery_started_at = 0.0
+    was_leader_visible = False
 
     while not stop_event.is_set():
+        if _take_follower_runtime_reset():
+            spacing.reset()
+            turn_tracker.reset()
+            commanded_speed = 0.0
+            leader_loss_streak = 0
+            leader_visible = False
+            was_leader_visible = False
+            last_distance_signal = None
+            last_span_px = None
+            line_streak = 0
+            intersection_phase = None
+            intersection_direction = None
+            intersection_arc_end = 0.0
+            intersection_end = 0.0
+            recovery_streak = 0
+            recovery_started_at = 0.0
+            mode = STATE_CRUISING
+            prev_mode = None
+            print("[Project][Follower] Runtime reset — spacing and intersection state cleared", flush=True)
+
         now = time.time()
         frame_dt = max(1e-3, now - last_drive_ts)
         last_drive_ts = now
@@ -1569,6 +1608,10 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 if leader_loss_streak >= loss_confirm:
                     leader_visible = False
             last_grid = now
+
+        elif not leader_visible and was_leader_visible:
+            spacing.reset()
+        was_leader_visible = leader_visible
 
         if red_prox.at_line:
             line_streak += 1

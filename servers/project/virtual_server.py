@@ -178,6 +178,7 @@ def video():
 @app.route('/reset', methods=['POST'])
 def reset():
     agent.set_driving_enabled(False)
+    agent.request_follower_runtime_reset()
     if wheels is not None:
         wheels.reset_game()
         time.sleep(0.2)

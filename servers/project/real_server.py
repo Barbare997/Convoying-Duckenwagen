@@ -108,6 +108,7 @@ from tasks.visual_lane_servoing.packages.agent import (
 from tasks.visual_lane_servoing.packages import visual_servoing_activity as _lane_activity
 
 import tasks.project.packages.agent as agent
+from tasks.project.packages.leader_grid import reset_grid_tracker
 
 
 
@@ -396,10 +397,13 @@ def video():
 def reset():
 
     agent.set_driving_enabled(False)
+    agent.request_follower_runtime_reset()
 
     if wheels is not None:
 
         wheels.set_wheels_speed(0.0, 0.0)
+
+    reset_grid_tracker()
 
     return jsonify({'status': 'ok'})
 
