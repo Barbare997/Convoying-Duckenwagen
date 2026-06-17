@@ -57,21 +57,35 @@ intersection_red_confirm_frames: 2
 intersection_red_approach_min_far_px: 600
 intersection_turn_track_window: 20
 intersection_turn_infer_lookback: 8
+# Turn inference: bbox gets squarer (width shrinks) when leader yaws; center often stays mid-frame.
+intersection_aspect_drop_frac: 0.10
+intersection_aspect_baseline_frames: 4
 intersection_cx_drift_px: 30
+intersection_cx_drift_weak_scale: 0.5
 intersection_heading_thresh: 0.12
+# Flip raw grid heading onto turn direction: leader right yaw -> right column taller -> raw h<0 -> turn right.
+intersection_heading_sign: -1.0
+intersection_heading_weak_scale: 0.55
 # Turn/recovery speeds (~slow_speed); outer/inner ratio sets differential arc
 intersection_turn_speed: 0.15
+# Left/right: lane-follow on red line this long before differential arc starts.
+intersection_turn_delay_s: 2.0
+intersection_turn_wait_speed: 0.12
 intersection_turn_inner_ratio: 0.27
 intersection_turn_outer_ratio: 1.0
+# Straight intersection: follow white lane edge (not blind equal PWM / robot heading).
+intersection_straight_use_lane: true
+intersection_straight_min_white_px: 200
+intersection_straight_lane_half_width_px: 160
 intersection_turn_straight_s: 1.4
 intersection_turn_left_s: 2.1
 intersection_turn_right_s: 2.1
 # Extra straight driving at end of TURN (same phase, after arc timer)
 intersection_turn_tail_straight_s: 1.6
-intersection_recovery_min_s: 2.8
-intersection_recovery_lane_frames: 20
+intersection_recovery_min_s: 1.5
+intersection_recovery_lane_frames: 12
 intersection_recovery_min_lane_px: 700
-intersection_recovery_max_red_px: 500
+intersection_recovery_max_red_px: 800
 intersection_recovery_require_clear_red: true
 
 

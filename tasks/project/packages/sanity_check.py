@@ -172,6 +172,39 @@ def test_red_at_line_near_band():
     print("OK: intersection triggers only on near red band")
 
 
+def test_intersection_straight_lane_pwm():
+    from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
+    from tasks.project.packages.intersection_follow import intersection_straight_lane_pwm
+
+    agent = LaneServoingAgent()
+    cfg = {
+        "intersection_turn_speed": 0.15,
+        "intersection_straight_min_white_px": 100,
+        "intersection_straight_lane_half_width_px": 160,
+    }
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert intersection_straight_lane_pwm(agent, frame, cfg) is None
+
+    frame[200:470, 500:520] = (255, 255, 255)
+    pwm = intersection_straight_lane_pwm(agent, frame, cfg)
+    assert pwm is not None
+    left, right = pwm
+    assert abs(left - right) > 1e-4, "white edge should steer, not blind equal PWM"
+    print("OK: intersection straight follows white boundary")
+
+
+def test_lane_ignore_red_for_convoy():
+    from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
+
+    agent = LaneServoingAgent()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    agent.compute_commands(rgb, use_red=False)
+    assert int(np.count_nonzero(agent.last_debug_info["red_mask"])) == 0
+    assert agent.last_debug_info.get("lane_use_red") is False
+    print("OK: convoy lane steer ignores red markings")
+
+
 def test_leader_turn_tracker():
     from tasks.project.packages.intersection_follow import (
         LeaderTurnTracker,
@@ -185,41 +218,55 @@ def test_leader_turn_tracker():
     cfg = {
         "intersection_cx_drift_px": 20,
         "intersection_heading_thresh": 0.1,
+        "intersection_heading_sign": -1.0,
+        "intersection_heading_weak_scale": 0.55,
+        "intersection_aspect_drop_frac": 0.10,
+        "intersection_aspect_baseline_frames": 3,
         "intersection_turn_infer_lookback": 10,
         "intersection_red_approach_min_far_px": 100,
     }
     pat = (7, 3)
+    wide = (100, 50, 300, 110)
+    narrow = (130, 50, 270, 110)
+
     tr = LeaderTurnTracker(window=10)
     tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for _ in range(4):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, bbox=wide, center_x=200.0, heading=0.02,
+        ))
+    for _ in range(6):
+        # Leader yaws right: right grid column taller -> raw heading negative
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, bbox=narrow, center_x=200.0, heading=-0.15,
+        ))
+    assert tr.infer(cfg) == TURN_RIGHT, "squarer bbox + raw heading<0 => right"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for _ in range(4):
+        tr.update(GridDetection(True, 0.5, 1.0, None, pat, bbox=wide, center_x=200.0, heading=-0.02))
+    for _ in range(6):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, bbox=narrow, center_x=200.0, heading=0.15,
+        ))
+    assert tr.infer(cfg) == TURN_LEFT, "squarer bbox + raw heading>0 => left"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for _ in range(10):
+        tr.update(GridDetection(
+            True, 0.5, 1.0, None, pat, bbox=wide, center_x=200.0, heading=0.02,
+        ))
+    assert tr.infer(cfg) == TURN_STRAIGHT, "wide stable bbox => straight"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
     for cx in range(100, 160, 5):
         tr.update(GridDetection(
-            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=0.15,
+            True, 0.5, 1.0, None, pat, bbox=wide, center_x=float(cx), heading=0.02,
         ))
-    assert tr.infer(cfg) == TURN_RIGHT, "cx + heading agree => right"
-
-    tr.reset()
-    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
-    for cx in range(200, 140, -5):
-        tr.update(GridDetection(
-            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=-0.15,
-        ))
-    assert tr.infer(cfg) == TURN_LEFT, "cx + heading agree => left"
-
-    tr.reset()
-    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
-    for cx in range(100, 160, 5):
-        tr.update(GridDetection(
-            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=-0.15,
-        ))
-    assert tr.infer(cfg) == TURN_STRAIGHT, "disagreeing signals => straight"
-
-    tr.reset()
-    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
-    for cx in [150, 152, 151, 153, 150, 152]:
-        tr.update(GridDetection(
-            True, 0.5, 1.0, None, pat, center_x=float(cx), heading=0.02,
-        ))
-    assert tr.infer(cfg) == TURN_STRAIGHT, "small drift on straight => straight"
+    assert tr.infer(cfg) == TURN_STRAIGHT, "cx drift without aspect drop or heading => straight"
 
     print("OK: leader turn tracker")
 
@@ -419,6 +466,8 @@ if __name__ == "__main__":
     test_follower_grid_signal_mock()
     test_grid_spacing_controller()
     test_red_at_line_near_band()
+    test_intersection_straight_lane_pwm()
+    test_lane_ignore_red_for_convoy()
     test_leader_turn_tracker()
     test_slow_sign_delay()
     test_tag_slow_distance_engages()

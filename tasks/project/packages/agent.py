@@ -11,10 +11,14 @@ import yaml
 from tasks.project.packages.follower_spacing import GridSpacingController
 from tasks.project.packages.intersection_follow import (
     LeaderTurnTracker,
+    intersection_straight_lane_pwm,
     intersection_turn_duration,
     intersection_wheel_commands,
     lane_frame_ok_for_recovery,
     measure_red_at_line,
+    TURN_LEFT,
+    TURN_RIGHT,
+    TURN_STRAIGHT,
 )
 from tasks.project.packages.leader_grid import (
     GridDetection,
@@ -174,10 +178,22 @@ def load_config() -> Dict[str, Any]:
         "intersection_turn_track_window": int(cfg.get("intersection_turn_track_window", 20)),
         "intersection_turn_infer_lookback": int(cfg.get("intersection_turn_infer_lookback", 8)),
         "intersection_cx_drift_px": float(cfg.get("intersection_cx_drift_px", 30.0)),
+        "intersection_cx_drift_weak_scale": float(cfg.get("intersection_cx_drift_weak_scale", 0.5)),
         "intersection_heading_thresh": float(cfg.get("intersection_heading_thresh", 0.12)),
+        "intersection_heading_sign": float(cfg.get("intersection_heading_sign", -1.0)),
+        "intersection_heading_weak_scale": float(cfg.get("intersection_heading_weak_scale", 0.55)),
+        "intersection_aspect_drop_frac": float(cfg.get("intersection_aspect_drop_frac", 0.10)),
+        "intersection_aspect_baseline_frames": int(cfg.get("intersection_aspect_baseline_frames", 4)),
         "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
+        "intersection_turn_delay_s": float(cfg.get("intersection_turn_delay_s", 2.0)),
+        "intersection_turn_wait_speed": float(cfg.get("intersection_turn_wait_speed", 0.12)),
         "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
         "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
+        "intersection_straight_use_lane": bool(cfg.get("intersection_straight_use_lane", True)),
+        "intersection_straight_min_white_px": int(cfg.get("intersection_straight_min_white_px", 200)),
+        "intersection_straight_lane_half_width_px": float(
+            cfg.get("intersection_straight_lane_half_width_px", 160.0)
+        ),
         "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.2)),
         "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 1.8)),
         "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.8)),
@@ -446,18 +462,6 @@ def _speed_ramp_delta(cfg: Dict[str, Any], frame_dt: float) -> float:
     ramp_s = max(0.05, float(cfg.get("speed_ramp_s", 1.0)))
     span = max(0.05, abs(cruise - slow))
     return span / ramp_s * max(1e-3, float(frame_dt))
-
-
-def _leader_use_direct_pwm(
-    lane_direct: bool,
-    state: str,
-    current_speed: float,
-    cruise_speed: float,
-) -> bool:
-    """Direct lane PWM only at full cruise; ramping uses scaled cap."""
-    if not lane_direct or state != STATE_CRUISING:
-        return False
-    return current_speed >= cruise_speed - 0.02
 
 
 def next_state(current_state: str, event: str) -> str:
@@ -1259,20 +1263,30 @@ def _remember_lane_pwm(lane_agent: LaneServoingAgent, left: float, right: float)
     lane_agent._last_right = float(right)
 
 
-def _maybe_drive_wheels(
-    wheels,
-    left: float,
-    right: float,
-    speed_cap: float,
-    use_direct_pwm: bool,
-) -> None:
-    """Apply lane PWM only when UI Start is active (same as visual_lane_servoing)."""
+# Leader / follower cruise lane: yellow+white only; red handled separately on follower.
+_PROJECT_LANE_KWARGS = {"use_red": False}
+
+
+def _leader_lane_pwm(lane_agent, frame_bgr):
+    """Yellow+white lane steer; red stop-line band masked out (follower uses red separately)."""
+    if frame_bgr is None:
+        return None
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    return lane_agent.compute_commands(frame_rgb, **_PROJECT_LANE_KWARGS)
+
+
+def _drive_leader_wheels(wheels, lane_agent, frame_bgr, lane_direct, speed_cap):
     if wheels is None:
         return
     if not is_driving_enabled():
         _safe_stop(wheels)
         return
-    _apply_lane_wheels(wheels, left, right, speed_cap, use_direct_pwm)
+    pwm = _leader_lane_pwm(lane_agent, frame_bgr)
+    if pwm is None:
+        return
+    left, right = pwm
+    _remember_lane_pwm(lane_agent, left, right)
+    _apply_lane_wheels(wheels, left, right, speed_cap, lane_direct)
 
 
 def _apply_lane_wheels(
@@ -1282,14 +1296,19 @@ def _apply_lane_wheels(
     speed_cap: float,
     use_direct_pwm: bool,
 ) -> None:
-    """Drive from lane agent PWM, always capped by speed_cap (preserves steer ratio)."""
+    """Direct PWM = visual_lane_servoing. Otherwise scale steer to speed_cap."""
     if wheels is None:
         return
     left_f = float(left)
     right_f = float(right)
+    if use_direct_pwm:
+        wheels.set_wheels_speed(
+            min(1.0, max(0.0, left_f)),
+            min(1.0, max(0.0, right_f)),
+        )
+        return
     peak = max(1e-6, max(abs(left_f), abs(right_f)))
-    cap = max(0.0, float(speed_cap))
-    scale = cap / peak
+    scale = max(0.0, float(speed_cap)) / peak
     wheels.set_wheels_speed(
         min(1.0, left_f * scale),
         min(1.0, right_f * scale),
@@ -1319,8 +1338,9 @@ def _drive_follower(
     if wheel_pwm is not None:
         left_pwm, right_pwm = wheel_pwm
     elif frame_bgr is not None:
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        left_pwm, right_pwm = lane_agent.compute_commands(frame_rgb)
+        left_pwm, right_pwm = lane_agent.compute_commands(
+            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), **_PROJECT_LANE_KWARGS,
+        )
     else:
         left_pwm, right_pwm = commanded_speed, commanded_speed
 
@@ -1348,10 +1368,10 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         flush=True,
     )
     if lane_direct:
-        print("[Project][Leader] Lane PWM: direct (speed/P-gain from lane_servoing_config.yaml).")
+        print("[Project][Leader] Lane PWM: direct (lane_servoing_config.yaml, like visual_lane_servoing).")
     else:
         print("[Project][Leader] Lane PWM: scaled to cruise_speed / slow_speed.")
- 
+
     last_log = 0.0
     last_drive_ts = time.time()
     state = STATE_CRUISING
@@ -1439,38 +1459,18 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             current_speed = _ramp_toward(
                 current_speed, speed_target, _speed_ramp_delta(cfg, frame_dt)
             )
-            if wheels is not None and frame_bgr is not None:
-                lane_agent = _get_lane_agent()
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                left, right = lane_agent.compute_commands(frame_rgb)
-                _remember_lane_pwm(lane_agent, left, right)
-                _maybe_drive_wheels(
-                    wheels, left, right, current_speed, use_direct_pwm=False
-                )
-            elif wheels is not None and is_driving_enabled():
-                wheels.set_wheels_speed(current_speed, current_speed)
-            elif wheels is not None:
-                _safe_stop(wheels)
+            _drive_leader_wheels(
+                wheels, _get_lane_agent(), frame_bgr, lane_direct=False, speed_cap=slow_speed,
+            )
         else:
             state = STATE_CRUISING
             speed_target = cruise_speed
             current_speed = _ramp_toward(
                 current_speed, speed_target, _speed_ramp_delta(cfg, frame_dt)
             )
-            if wheels is not None and frame_bgr is not None:
-                lane_agent = _get_lane_agent()
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                left, right = lane_agent.compute_commands(frame_rgb)
-                _remember_lane_pwm(lane_agent, left, right)
-                use_direct = _leader_use_direct_pwm(
-                    lane_direct, state, current_speed, cruise_speed
-                )
-                cap = cruise_speed if use_direct else current_speed
-                _maybe_drive_wheels(wheels, left, right, cap, use_direct)
-            elif wheels is not None and is_driving_enabled():
-                wheels.set_wheels_speed(current_speed, current_speed)
-            elif wheels is not None:
-                _safe_stop(wheels)
+            _drive_leader_wheels(
+                wheels, _get_lane_agent(), frame_bgr, lane_direct=lane_direct, speed_cap=cruise_speed,
+            )
 
         if now - last_log >= 2.0:
             print(
@@ -1539,6 +1539,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     line_streak = 0
     intersection_phase = None  # None | "TURN" | "RECOVERY"
     intersection_direction = None
+    intersection_arc_start = 0.0
     intersection_arc_end = 0.0
     intersection_end = 0.0
     recovery_streak = 0
@@ -1576,22 +1577,29 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             line_streak = 0
 
         if (
-            intersection_phase is None
-            and line_streak >= red_confirm
+            line_streak >= red_confirm
             and is_driving_enabled()
+            and intersection_phase is None
         ):
-            drift, cx_vote, heading_vote = turn_tracker.debug_votes(cfg)
+            turn_dbg = turn_tracker.debug_votes(cfg)
             intersection_direction = turn_tracker.infer(cfg)
             intersection_phase = "TURN"
             arc_s = intersection_turn_duration(intersection_direction, cfg)
             tail_s = max(0.0, float(cfg.get("intersection_turn_tail_straight_s", 1.6)))
-            intersection_arc_end = now + arc_s
-            intersection_end = now + arc_s + tail_s
+            delay_s = 0.0
+            if intersection_direction in (TURN_LEFT, TURN_RIGHT):
+                delay_s = max(0.0, float(cfg.get("intersection_turn_delay_s", 2.0)))
+            intersection_arc_start = now + delay_s
+            intersection_arc_end = intersection_arc_start + arc_s
+            intersection_end = intersection_arc_end + tail_s
             recovery_streak = 0
             print(
                 f"[Project][Follower] Red line — turn {intersection_direction} "
-                f"(cx_drift={drift:.0f}px cx={cx_vote} heading={heading_vote}; "
-                f"near_px={red_prox.near_px}) arc={arc_s:.1f}s tail={tail_s:.1f}s",
+                f"(yawing={turn_dbg['yawing']} aspect_drop={turn_dbg['aspect_drop_frac']:.2f} "
+                f"aspect={turn_dbg['aspect_baseline']:.2f}->{turn_dbg['aspect_recent']:.2f} "
+                f"cx_drift={turn_dbg['cx_drift']:.0f}px cx={turn_dbg['cx_vote']} "
+                f"heading={turn_dbg['heading_vote']}; near_px={red_prox.near_px}) "
+                f"wait={delay_s:.1f}s arc={arc_s:.1f}s tail={tail_s:.1f}s",
                 flush=True,
             )
 
@@ -1602,10 +1610,32 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
 
         if intersection_phase == "TURN":
             mode = STATE_INTERSECTION
-            in_tail = now >= intersection_arc_end
-            drive_dir = "straight" if in_tail else intersection_direction
-            wheel_pwm = intersection_wheel_commands(drive_dir, cfg)
-            follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
+            if (
+                intersection_direction in (TURN_LEFT, TURN_RIGHT)
+                and now < intersection_arc_start
+            ):
+                wheel_pwm = None
+                wait_speed = float(cfg.get("intersection_turn_wait_speed", 0.12))
+                target_speed = min(target_speed, wait_speed)
+                follow_mode = f"turn_wait_{intersection_direction}"
+            elif (
+                intersection_direction == TURN_STRAIGHT
+                and bool(cfg.get("intersection_straight_use_lane", True))
+            ):
+                lane_pwm = intersection_straight_lane_pwm(lane_agent, frame_bgr, cfg)
+                wheel_pwm = (
+                    lane_pwm
+                    if lane_pwm is not None
+                    else intersection_wheel_commands(TURN_STRAIGHT, cfg)
+                )
+                turn_cap = float(cfg.get("intersection_turn_speed", 0.15))
+                target_speed = min(target_speed, turn_cap)
+                follow_mode = "turn_straight_lane"
+            else:
+                in_tail = now >= intersection_arc_end
+                drive_dir = TURN_STRAIGHT if in_tail else intersection_direction
+                wheel_pwm = intersection_wheel_commands(drive_dir, cfg)
+                follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
             if now >= intersection_end:
                 intersection_phase = "RECOVERY"
                 recovery_streak = 0
@@ -1624,6 +1654,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                     recovery_streak = 0
             if recovery_streak >= max(1, int(cfg.get("intersection_recovery_lane_frames", 20))):
                 intersection_phase = None
+                intersection_direction = None
                 line_streak = 0
                 turn_tracker.reset()
                 recovery_streak = 0
@@ -1648,7 +1679,11 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             leader_visible=leader_visible,
             follow_mode=follow_mode,
             intersection_phase=intersection_phase or "-",
-            intersection_turn=intersection_direction or "-",
+            intersection_turn=(
+                intersection_direction
+                if intersection_phase == "TURN"
+                else "-"
+            ),
             red_near_px=red_prox.near_px,
             red_at_line=red_prox.at_line,
             tag_ids=[],

@@ -31,7 +31,7 @@ def _red_hsv_mask(hsv: np.ndarray) -> np.ndarray:
     return mask
 
 
-def detect_lane_markings(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def detect_lane_markings(image: np.ndarray, detect_red: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     # 1) Ignore sky / far field; keep road-focused band (lower ~72%).
     h, w = image.shape[:2]
     crop_top = int(h * 0.28)
@@ -44,7 +44,7 @@ def detect_lane_markings(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     yellow_mask_cfg = cv2.inRange(hsv, _yellow_lower, _yellow_upper)
     white_mask_cfg = cv2.inRange(hsv, _white_lower, _white_upper)
-    red_mask_cfg = _red_hsv_mask(hsv)
+    red_mask_cfg = _red_hsv_mask(hsv) if detect_red else np.zeros_like(yellow_mask_cfg)
 
     yellow_mask = yellow_mask_cfg
     white_mask = white_mask_cfg
