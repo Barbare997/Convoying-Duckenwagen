@@ -26,7 +26,10 @@ from tasks.project.packages.leader_grid import (
     fetch_leader_grid,
     get_cached_grid_detection,
 )
-from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
+from tasks.visual_lane_servoing.packages.agent import (
+    LaneServoingAgent,
+    _PROJECT_LANE_IGNORE_BOTTOM_FRAC,
+)
  
 _CONFIG_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "project_config.yaml")
@@ -1267,12 +1270,15 @@ def _remember_lane_pwm(lane_agent: LaneServoingAgent, left: float, right: float)
     lane_agent._last_right = float(right)
 
 
-# Leader / follower cruise lane: yellow+white only; red handled separately on follower.
-_PROJECT_LANE_KWARGS = {"use_red": False}
+# Leader / follower cruise: steer yellow+white only; still detect red for UI + intersections.
+_PROJECT_LANE_KWARGS = {
+    "ignore_bottom_frac": _PROJECT_LANE_IGNORE_BOTTOM_FRAC,
+    "debug_red_mask": True,
+}
 
 
 def _leader_lane_pwm(lane_agent, frame_bgr):
-    """Yellow+white lane steer; red stop-line band masked out (follower uses red separately)."""
+    """Yellow+white steer; red detected for debug/follower intersections (not steering)."""
     if frame_bgr is None:
         return None
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -1372,23 +1378,20 @@ def _follower_cruise_target_speed(
     last_span_px,
 ):
     """Spacing speed for normal cruise — conservative at startup, never blind full throttle."""
+    if not leader_visible:
+        if bool(cfg.get("follower_require_leader", True)):
+            return follower_min
+        fallback = float(cfg.get("follower_lane_fallback_speed", cruise_speed))
+        return max(follower_min, min(follower_max, fallback))
+
     target_speed = spacing.compute_target_speed(cfg, follower_min, follower_max)
 
-    if bool(cfg.get("follower_require_leader", True)) and not leader_visible:
-        return follower_min
-
     warmup = max(1, int(cfg.get("follower_spacing_warmup_frames", 8)))
-    if leader_visible and leader_grid_samples < warmup:
+    if leader_grid_samples < warmup:
         return min(target_speed, slow_speed)
 
-    if leader_visible:
-        catchup = max(0.0, float(cfg.get("follower_catchup_margin", 0.06)))
-        target_speed = min(target_speed, cruise_speed + catchup)
-    else:
-        target_speed = min(
-            target_speed,
-            float(cfg.get("follower_lane_fallback_speed", slow_speed)),
-        )
+    catchup = max(0.0, float(cfg.get("follower_catchup_margin", 0.06)))
+    target_speed = min(target_speed, cruise_speed + catchup)
 
     too_close_px = float(cfg.get("span_too_close_px", 44.0))
     if last_span_px is not None and last_span_px >= too_close_px:

@@ -19,6 +19,16 @@ _white_upper = np.array([_h.get('white_upper_h', 0), _h.get('white_upper_s', 0),
 
 _red_lower = np.array([_h.get('red_lower_h', 0), _h.get('red_lower_s', 100), _h.get('red_lower_v', 100)])
 _red_upper = np.array([_h.get('red_upper_h', 10), _h.get('red_upper_s', 255), _h.get('red_upper_v', 255)])
+# Fraction of frame height cropped from top before lane HSV (higher = ignore more far field).
+_LANE_CROP_TOP_FRAC = float(_h.get('lane_crop_top_frac', 0.45))
+# Horizontal mask limits (fraction of image width): yellow kept left of max, white kept right of min.
+_LANE_YELLOW_MAX_X_FRAC = float(_h.get('lane_yellow_max_x_frac', 0.97))
+_LANE_WHITE_MIN_X_FRAC = float(_h.get('lane_white_min_x_frac', 0.28))
+# Optional extra top crop for white only (must be >= lane_crop_top_frac; higher = less far white).
+_lane_white_crop_raw = _h.get('lane_white_crop_top_frac')
+_LANE_WHITE_CROP_TOP_FRAC = (
+    float(_lane_white_crop_raw) if _lane_white_crop_raw is not None else None
+)
 
 
 def _red_hsv_mask(hsv: np.ndarray) -> np.ndarray:
@@ -32,9 +42,13 @@ def _red_hsv_mask(hsv: np.ndarray) -> np.ndarray:
 
 
 def detect_lane_markings(image: np.ndarray, detect_red: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # 1) Ignore sky / far field; keep road-focused band (lower ~72%).
+    # Ignore sky / far field; process road band below crop line.
     h, w = image.shape[:2]
-    crop_top = int(h * 0.28)
+    crop_frac = min(max(_LANE_CROP_TOP_FRAC, 0.0), 0.75)
+    crop_top = int(h * crop_frac)
+    white_crop_frac = _LANE_WHITE_CROP_TOP_FRAC if _LANE_WHITE_CROP_TOP_FRAC is not None else crop_frac
+    white_crop_frac = min(max(white_crop_frac, crop_frac), 0.75)
+    white_crop_top = int(h * white_crop_frac)
     roi = image[crop_top:, :]
 
     # 2) Blur to reduce high-frequency noise before color thresholding.
@@ -50,12 +64,17 @@ def detect_lane_markings(image: np.ndarray, detect_red: bool = True) -> Tuple[np
     white_mask = white_mask_cfg
     red_mask = red_mask_cfg
 
-    # Geometric prior with overlap (less brittle in curves).
-    left_limit = int(0.70 * w)
-    right_limit = int(0.30 * w)
-    yellow_mask[:, left_limit:] = 0
-    white_mask[:, :right_limit] = 0
-    red_mask[:, left_limit:] = 0
+    # Geometric prior: keep yellow on left side, white on right (overlap allowed in middle).
+    yellow_max = int(min(max(_LANE_YELLOW_MAX_X_FRAC, 0.5), 0.98) * w)
+    white_min = int(min(max(_LANE_WHITE_MIN_X_FRAC, 0.02), 0.5) * w)
+    yellow_mask[:, yellow_max:] = 0
+    white_mask[:, :white_min] = 0
+    red_mask[:, yellow_max:] = 0
+
+    # Drop far-ahead white only (yellow/red keep the wider vertical band).
+    white_top_clip = white_crop_top - crop_top
+    if white_top_clip > 0:
+        white_mask[:white_top_clip, :] = 0
 
     kernel = np.ones((3, 3), dtype=np.uint8)
     yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)

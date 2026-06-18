@@ -13,7 +13,7 @@ _CONFIG_FILE = os.path.normpath(os.path.join(
 ))
 
 _LINE_OFFSET = 160
-_ROI_START   = 0.45
+_ROI_START   = 0.56
 _NUM_SLICES  = 3
 _SLICE_TOL   = 5
 # Small nudge toward lane center (keep symmetric — large white bias caused false right steer).
@@ -42,12 +42,12 @@ def detect_lines_in_slices(
     mask_yellow: np.ndarray,
     mask_white:  np.ndarray,
     h: int,
-    mask_red: np.ndarray = None,
-) -> Tuple[list, list, list]:
+) -> Tuple[list, list]:
+    """Scan horizontal slices for yellow (left) and white (right) lane x positions."""
     w = mask_yellow.shape[1]
     slice_height = int(h * 0.35 / _NUM_SLICES)
     start_y      = int(h * _ROI_START)
-    yellow_xs, white_xs, red_xs = [], [], []
+    yellow_xs, white_xs = [], []
 
     for i in range(_NUM_SLICES):
         y = start_y + i * slice_height + slice_height // 2
@@ -65,15 +65,7 @@ def detect_lines_in_slices(
         if len(idx) > 0:
             white_xs.append(max(0, int(np.min(idx)) - _WHITE_CENTER_BIAS_PX))
 
-        if mask_red is not None:
-            strip_r = mask_red[y - _SLICE_TOL: y + _SLICE_TOL, :]
-            idx = _largest_component_cols(strip_r)
-            if len(idx) > 0:
-                r_edge = int(np.percentile(idx, 90))
-                r_inset = int(_YELLOW_CENTER_BIAS_PX + far_frac * _YELLOW_FAR_SLICE_BIAS_PX)
-                red_xs.append(min(w - 1, r_edge + r_inset))
-
-    return yellow_xs, white_xs, red_xs
+    return yellow_xs, white_xs
 
 
 class LaneServoingAgent:
@@ -175,85 +167,73 @@ class LaneServoingAgent:
     def compute_commands(
         self,
         image: np.ndarray,
-        use_red: bool = True,
         ignore_bottom_frac: float = 0.0,
+        debug_red_mask: bool = True,
     ) -> Tuple[float, float]:
+        """Lane steer from yellow + white only. Red mask is debug/intersection-only."""
         self.frame_count += 1
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
         try:
-            mask_y, mask_w, mask_r = student.detect_lane_markings(bgr, detect_red=use_red)
+            mask_y, mask_w, mask_r = student.detect_lane_markings(
+                bgr, detect_red=debug_red_mask,
+            )
         except Exception as e:
             print(f"[Agent] detect_lane_markings error: {e}")
             return 0.0, 0.0
 
-        if not use_red:
-            mask_r = np.zeros_like(mask_y)
-            if ignore_bottom_frac <= 0.0:
-                ignore_bottom_frac = _PROJECT_LANE_IGNORE_BOTTOM_FRAC
-            if ignore_bottom_frac > 0.0:
-                y_keep = int(mask_y.shape[0] * (1.0 - min(0.55, ignore_bottom_frac)))
-                mask_y[y_keep:, :] = 0
-                mask_w[y_keep:, :] = 0
+        if ignore_bottom_frac > 0.0:
+            y_keep = int(mask_y.shape[0] * (1.0 - min(0.55, ignore_bottom_frac)))
+            mask_y[y_keep:, :] = 0
+            mask_w[y_keep:, :] = 0
 
-        mask_left = np.clip(mask_y + mask_r, 0, 1)
         mask_y_vis = (mask_y * 255).astype(np.uint8)
-        mask_r_vis = (mask_r * 255).astype(np.uint8)
-        mask_w = (mask_w * 255).astype(np.uint8)
+        mask_r_vis = (mask_r * 255).astype(np.uint8) if debug_red_mask else np.zeros_like(mask_y_vis)
+        mask_w_vis = (mask_w * 255).astype(np.uint8)
 
         yellow_pixels = int(np.count_nonzero(mask_y_vis))
-        red_pixels = int(np.count_nonzero(mask_r_vis))
-        white_pixels  = int(np.count_nonzero(mask_w))
-        total_pixels  = yellow_pixels + red_pixels + white_pixels
+        white_pixels = int(np.count_nonzero(mask_w_vis))
+        total_pixels = yellow_pixels + white_pixels
 
-        if not use_red:
-            total_pixels = yellow_pixels + white_pixels
-
-        combined = np.clip(mask_left + (mask_w // 255), 0, 1)
+        combined = np.clip(mask_y + (mask_w // 255), 0, 1)
         self.last_debug_info = {
             'roi':               image,
             'frame_bgr':         bgr,
             'lane_mask':         (combined * 255).astype(np.uint8),
-            'white_mask':        mask_w,
+            'white_mask':        mask_w_vis,
             'yellow_mask':       mask_y_vis,
             'red_mask':          mask_r_vis,
             'total_lane_pixels': total_pixels,
             'lateral_error':     float(np.clip(self._prev_error, -1.0, 1.0)),
             'lane_detected':     total_pixels >= self.detection_threshold,
             'frame_count':       self.frame_count,
-            'lane_use_red':      use_red,
-            'lane_ignore_bottom_frac': float(ignore_bottom_frac if not use_red else 0.0),
+            'lane_use_red':      False,
+            'lane_ignore_bottom_frac': float(ignore_bottom_frac),
         }
 
-        h, w      = mask_y_vis.shape
-        left_det  = yellow_pixels > 0 if not use_red else (yellow_pixels + red_pixels) > 0
-        right_det = white_pixels  > 0
-        recovery  = total_pixels  < self.detection_threshold
+        h, w = mask_y_vis.shape
+        left_det = yellow_pixels > 0
+        right_det = white_pixels > 0
+        recovery = total_pixels < self.detection_threshold
 
-        mask_left_u8 = (mask_left * 255).astype(np.uint8)
-        red_for_slices = mask_r_vis if use_red else None
-        yellow_xs, white_xs, red_xs = detect_lines_in_slices(
-            mask_left_u8, mask_w, h, red_for_slices,
-        )
-        if not use_red:
-            red_xs = []
-        both_visible        = left_det and right_det and not recovery
-        is_curve, curve_dir = detect_curve(yellow_xs, white_xs, self.curve_threshold, red_xs)
+        yellow_xs, white_xs = detect_lines_in_slices(mask_y_vis, mask_w_vis, h)
+        both_visible = left_det and right_det and not recovery
+        is_curve, curve_dir = detect_curve(yellow_xs, white_xs, self.curve_threshold)
 
-        raw_error            = self._calculate_error(yellow_xs, white_xs, left_det, right_det, w)
+        raw_error = self._calculate_error(yellow_xs, white_xs, left_det, right_det, w)
         self._filtered_error = 0.7 * self._filtered_error + 0.3 * raw_error
-        steering             = self._calculate_steering(self._filtered_error)
-        left, right          = self._motor_commands(
-            steering, recovery, is_curve, both_visible, allow_curve_boost=use_red,
+        steering = self._calculate_steering(self._filtered_error)
+        left, right = self._motor_commands(
+            steering, recovery, is_curve, both_visible, allow_curve_boost=True,
         )
-        left, right          = self._smooth(left, right, both_visible)
+        left, right = self._smooth(left, right, both_visible)
 
         slice_height = int(h * 0.35 / _NUM_SLICES)
-        start_y      = int(h * _ROI_START)
+        start_y = int(h * _ROI_START)
         self.last_debug_info.update({
             'yellow_xs': yellow_xs,
             'white_xs':  white_xs,
-            'red_xs':    red_xs,
+            'red_xs':    [],
             'slice_ys':  [start_y + i * slice_height + slice_height // 2 for i in range(_NUM_SLICES)],
             'is_curve':  is_curve,
             'curve_dir': curve_dir,

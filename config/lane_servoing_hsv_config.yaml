@@ -1,18 +1,26 @@
 white_lower_h: 0
 white_lower_s: 0
-white_lower_v: 193
+white_lower_v: 178
 white_upper_h: 179
-white_upper_s: 92
+white_upper_s: 120
 white_upper_v: 255
-yellow_lower_h: 3
-yellow_lower_s: 80
-yellow_lower_v: 152
-yellow_upper_h: 35
-yellow_upper_s: 255
+yellow_lower_h: 6
+yellow_lower_s: 97
+yellow_lower_v: 154
+yellow_upper_h: 48
+yellow_upper_s: 200
 yellow_upper_v: 255
+
 red_lower_h: 0
 red_lower_s: 100
-red_lower_v: 100
-red_upper_h: 10
+red_lower_v: 135
+red_upper_h: 33
 red_upper_s: 255
 red_upper_v: 255
+# Crop from top before lane HSV (0.28 = old default; higher = more top crop, nearer road only).
+lane_crop_top_frac: 0.45
+# Extra top crop for white only (>= lane_crop_top_frac). Yellow keeps lane_crop_top_frac.
+lane_white_crop_top_frac: 0.52
+# Side cutoffs: yellow zeroed right of max; white zeroed left of min (smaller margin = wider overlap).
+lane_yellow_max_x_frac: 0.97
+lane_white_min_x_frac: 0.28

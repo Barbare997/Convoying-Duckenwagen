@@ -285,7 +285,7 @@ def intersection_straight_lane_pwm(lane_agent, frame_bgr, cfg):
         from tasks.visual_lane_servoing.packages.agent import detect_lines_in_slices
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        lane_agent.compute_commands(frame_rgb, use_red=False)
+        lane_agent.compute_commands(frame_rgb, ignore_bottom_frac=0.0, debug_red_mask=False)
         debug = getattr(lane_agent, "last_debug_info", None) or {}
         mask_w = debug.get("white_mask")
         if mask_w is None:
@@ -297,7 +297,7 @@ def intersection_straight_lane_pwm(lane_agent, frame_bgr, cfg):
 
         h, w = mask_w.shape[:2]
         empty = np.zeros_like(mask_w)
-        _yellow_xs, white_xs, _red_xs = detect_lines_in_slices(empty, mask_w, h, None)
+        _yellow_xs, white_xs = detect_lines_in_slices(empty, mask_w, h)
         if not white_xs:
             return None
 

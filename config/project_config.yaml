@@ -14,22 +14,23 @@ lane_use_direct_pwm: false
 
 cruise_speed: 0.40
 
-slow_speed: 0.15
+slow_speed: 0.20
 
 
 
 follower_max_speed: 0.46
-follower_require_leader: true
+follower_require_leader: false
 follower_spacing_warmup_frames: 8
 follower_catchup_margin: 0.06
-follower_lane_fallback_speed: 0.15
+# Speed when leader grid is lost — lane follow at cruise (same as normal lane servoing).
+follower_lane_fallback_speed: 0.40
 
 follower_min_speed: 0.0
 
 # --- Grid spacing (span_px = mean dot spacing; grows as leader gets closer) ---
 # Park at desired gap on the bot, read span_px from logs, set span_target_px to that value.
 # Lower span_target_px = stay farther back (smaller dots in frame).
-span_target_px: 28.0
+span_target_px: 7.0
 spacing_kp: 0.012
 spacing_kd: 0.022
 spacing_span_dot_alpha: 0.35
@@ -37,7 +38,7 @@ spacing_leader_alpha: 0.12
 spacing_leader_ff_gain: 0.012
 spacing_steady_span_px: 5.0
 spacing_steady_span_dot: 10.0
-span_too_close_px: 44.0
+span_too_close_px: 18.0
 span_too_close_speed: 0.06
 
 # Circle-grid detect rate for follower (Hz)

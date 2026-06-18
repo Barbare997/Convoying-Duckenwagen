@@ -6,7 +6,6 @@ def detect_curve(
     yellow_xs: List[int],
     white_xs: List[int],
     curve_threshold: int = 350,
-    red_xs: List[int] = None,
 ) -> Tuple[bool, int]:
     shifts = []
 
@@ -15,9 +14,6 @@ def detect_curve(
 
     if len(white_xs) >= 2:
         shifts.append(white_xs[-1] - white_xs[0])
-
-    if red_xs and len(red_xs) >= 2:
-        shifts.append(red_xs[-1] - red_xs[0])
 
     # No reliable shift estimate from either line.
     if not shifts:

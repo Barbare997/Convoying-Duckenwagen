@@ -194,14 +194,20 @@ def test_intersection_straight_lane_pwm():
 
 
 def test_lane_ignore_red_for_convoy():
-    from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
+    from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent, detect_lines_in_slices
 
     agent = LaneServoingAgent()
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    agent.compute_commands(rgb, use_red=False)
+    agent.compute_commands(rgb, debug_red_mask=False)
     assert int(np.count_nonzero(agent.last_debug_info["red_mask"])) == 0
     assert agent.last_debug_info.get("lane_use_red") is False
+    yellow_xs, white_xs = detect_lines_in_slices(
+        agent.last_debug_info["yellow_mask"],
+        agent.last_debug_info["white_mask"],
+        agent.last_debug_info["yellow_mask"].shape[0],
+    )
+    assert len(yellow_xs) >= 0 and len(white_xs) >= 0
     print("OK: convoy lane steer ignores red markings")
 
 
@@ -473,7 +479,15 @@ def test_follower_cruise_target_speed_startup():
     blind = _follower_cruise_target_speed(
         spacing, cfg, 0.0, 0.48, 0.4, 0.15, False, 0, None,
     )
-    assert blind == 0.0, "no leader grid -> hold still"
+    assert blind == 0.0, "require_leader + no grid -> hold still"
+
+    cfg_lane = dict(cfg)
+    cfg_lane["follower_require_leader"] = False
+    cfg_lane["follower_lane_fallback_speed"] = 0.4
+    lane_only = _follower_cruise_target_speed(
+        spacing, cfg_lane, 0.0, 0.48, 0.4, 0.15, False, 0, None,
+    )
+    assert lane_only == 0.4, "lane fallback when leader lost"
 
     spacing.observe(18.0, 0.0, cfg, 0.0)
     early = _follower_cruise_target_speed(
