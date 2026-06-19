@@ -74,9 +74,11 @@ def _feed_convoy_frame(frame_bgr):
 
 
 def _refresh_display_masks(frame_bgr):
+    """Dashboard masks: full frame like visual_lane_servoing (no bottom crop)."""
     if _lane_agent is None or frame_bgr is None:
         return
-    agent._leader_lane_pwm(_lane_agent, frame_bgr)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    _lane_agent.compute_commands(frame_rgb, ignore_bottom_frac=0.0, debug_red_mask=True)
 
 
 def _apply_follower_grid_overlay(frame_bgr):

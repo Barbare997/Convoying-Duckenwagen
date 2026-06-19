@@ -193,6 +193,41 @@ def test_intersection_straight_lane_pwm():
     print("OK: intersection straight follows white boundary")
 
 
+def test_follower_skip_intersection_when_leader_lost():
+    from tasks.project.packages.agent import _follower_skip_intersection
+
+    cfg = {"follower_intersection_skip_leader_lost_s": 2.5}
+    now = 100.0
+    assert not _follower_skip_intersection(cfg, now, 99.0)
+    assert _follower_skip_intersection(cfg, now, 97.4)
+    assert _follower_skip_intersection(cfg, now, 0.0)
+    print("OK: follower skips intersection after leader lost long enough")
+
+
+def test_project_lane_masks_not_cut_on_straight():
+    from tasks.project.packages.agent import _project_lane_kwargs
+    from tasks.project.packages.intersection_follow import RedLineProximity
+
+    cfg = {
+        "lane_ignore_bottom_frac": 0.0,
+        "lane_ignore_bottom_at_intersection_frac": 0.35,
+        "intersection_red_approach_min_far_px": 600,
+    }
+    straight = _project_lane_kwargs(cfg, RedLineProximity(0, 0.0, 0, False))
+    assert straight["ignore_bottom_frac"] == 0.0
+
+    approaching = _project_lane_kwargs(
+        cfg, RedLineProximity(0, 0.0, 800, False),
+    )
+    assert approaching["ignore_bottom_frac"] == 0.0, "far red alone must not crop masks"
+
+    at_line = _project_lane_kwargs(
+        cfg, RedLineProximity(5000, 0.1, 800, True),
+    )
+    assert at_line["ignore_bottom_frac"] == 0.35
+    print("OK: project lane masks full on straights, trimmed only on red line")
+
+
 def test_lane_ignore_red_for_convoy():
     from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent, detect_lines_in_slices
 
@@ -549,6 +584,8 @@ if __name__ == "__main__":
     test_grid_spacing_controller()
     test_red_at_line_near_band()
     test_intersection_straight_lane_pwm()
+    test_project_lane_masks_not_cut_on_straight()
+    test_follower_skip_intersection_when_leader_lost()
     test_lane_ignore_red_for_convoy()
     test_leader_turn_tracker()
     test_follower_cruise_target_speed_startup()

@@ -26,10 +26,7 @@ from tasks.project.packages.leader_grid import (
     fetch_leader_grid,
     get_cached_grid_detection,
 )
-from tasks.visual_lane_servoing.packages.agent import (
-    LaneServoingAgent,
-    _PROJECT_LANE_IGNORE_BOTTOM_FRAC,
-)
+from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
  
 _CONFIG_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "project_config.yaml")
@@ -108,6 +105,9 @@ def load_config() -> Dict[str, Any]:
         "follower_spacing_warmup_frames": int(cfg.get("follower_spacing_warmup_frames", 8)),
         "follower_catchup_margin": float(cfg.get("follower_catchup_margin", 0.06)),
         "follower_lane_fallback_speed": float(cfg.get("follower_lane_fallback_speed", 0.15)),
+        "follower_intersection_skip_leader_lost_s": float(
+            cfg.get("follower_intersection_skip_leader_lost_s", 2.5)
+        ),
         "span_target_px": float(cfg.get("span_target_px", 32.0)),
         "spacing_kp": float(cfg.get("spacing_kp", 0.010)),
         "spacing_kd": float(cfg.get("spacing_kd", 0.018)),
@@ -172,6 +172,10 @@ def load_config() -> Dict[str, Any]:
         # True: send LaneServoingAgent PWM as-is (same as visual_lane_servoing task).
         # False: scale PWM so max(left,right) = cruise/slow speed from this file.
         "lane_use_direct_pwm": bool(cfg.get("lane_use_direct_pwm", False)),
+        "lane_ignore_bottom_frac": float(cfg.get("lane_ignore_bottom_frac", 0.0)),
+        "lane_ignore_bottom_at_intersection_frac": float(
+            cfg.get("lane_ignore_bottom_at_intersection_frac", 0.35)
+        ),
         # Sign input: apriltag | manual | both (manual overrides when not CRUISING).
         "sign_source": str(cfg.get("sign_source", "both")).strip().lower(),
         # Red-line intersection (follower): trigger only on near (bottom-band) red paint.
@@ -1270,28 +1274,58 @@ def _remember_lane_pwm(lane_agent: LaneServoingAgent, left: float, right: float)
     lane_agent._last_right = float(right)
 
 
-# Leader / follower cruise: steer yellow+white only; still detect red for UI + intersections.
-_PROJECT_LANE_KWARGS = {
-    "ignore_bottom_frac": _PROJECT_LANE_IGNORE_BOTTOM_FRAC,
-    "debug_red_mask": True,
-}
+# Leader / follower cruise: steer yellow+white; red for UI + intersections (not steering).
+def _project_lane_kwargs(cfg, red_prox=None):
+    """Same masks as visual_lane_servoing on straights; trim bottom only on the red line."""
+    ignore = float(cfg.get("lane_ignore_bottom_frac", 0.0))
+    if red_prox is not None and red_prox.at_line:
+        ignore = max(
+            ignore,
+            float(cfg.get("lane_ignore_bottom_at_intersection_frac", 0.35)),
+        )
+    return {"ignore_bottom_frac": ignore, "debug_red_mask": True}
 
 
-def _leader_lane_pwm(lane_agent, frame_bgr):
+def _follower_leader_lost_s(now, last_leader_seen_ts):
+    if last_leader_seen_ts <= 0:
+        return float("inf")
+    return max(0.0, float(now) - float(last_leader_seen_ts))
+
+
+def _follower_skip_intersection(cfg, now, last_leader_seen_ts):
+    """No timed turns when leader grid has been gone long enough — lane follow only."""
+    lost_s = _follower_leader_lost_s(now, last_leader_seen_ts)
+    return lost_s >= float(cfg.get("follower_intersection_skip_leader_lost_s", 2.5))
+
+
+def _follower_abort_intersection(
+    intersection_phase,
+    intersection_direction,
+    line_streak,
+    turn_tracker,
+    recovery_streak,
+):
+    """Clear intersection state and return reset values."""
+    turn_tracker.reset()
+    return None, None, 0, 0
+
+
+def _leader_lane_pwm(lane_agent, frame_bgr, cfg=None, red_prox=None):
     """Yellow+white steer; red detected for debug/follower intersections (not steering)."""
     if frame_bgr is None:
         return None
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    return lane_agent.compute_commands(frame_rgb, **_PROJECT_LANE_KWARGS)
+    lane_cfg = cfg if cfg is not None else load_config()
+    return lane_agent.compute_commands(frame_rgb, **_project_lane_kwargs(lane_cfg, red_prox))
 
 
-def _drive_leader_wheels(wheels, lane_agent, frame_bgr, lane_direct, speed_cap):
+def _drive_leader_wheels(wheels, lane_agent, frame_bgr, lane_direct, speed_cap, cfg=None, red_prox=None):
     if wheels is None:
         return
     if not is_driving_enabled():
         _safe_stop(wheels)
         return
-    pwm = _leader_lane_pwm(lane_agent, frame_bgr)
+    pwm = _leader_lane_pwm(lane_agent, frame_bgr, cfg=cfg, red_prox=red_prox)
     if pwm is None:
         return
     left, right = pwm
@@ -1342,6 +1376,7 @@ def _drive_follower(
     wheel_pwm=None,
     *,
     intersection_pwm=False,
+    lane_kwargs=None,
 ) -> float:
     """Ramp to spacing target, then lane steer or intersection arc PWM."""
     commanded_speed = _ramp_toward(
@@ -1350,8 +1385,9 @@ def _drive_follower(
     if wheel_pwm is not None:
         left_pwm, right_pwm = wheel_pwm
     elif frame_bgr is not None:
+        kwargs = lane_kwargs or {"debug_red_mask": True, "ignore_bottom_frac": 0.0}
         left_pwm, right_pwm = lane_agent.compute_commands(
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), **_PROJECT_LANE_KWARGS,
+            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), **kwargs,
         )
     else:
         left_pwm, right_pwm = commanded_speed, commanded_speed
@@ -1437,6 +1473,7 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         _maybe_auto_clear_manual_slow(now)
         frame_bgr, frame_gray = _extract_frame_gray(camera)
         frame_shape = None if frame_bgr is None else frame_bgr.shape[:2]
+        red_prox = measure_red_at_line(frame_bgr, cfg)
         if sign_source == "manual" or not is_driving_enabled():
             detections = []
             tag_event = EVENT_NORMAL
@@ -1511,6 +1548,7 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             )
             _drive_leader_wheels(
                 wheels, _get_lane_agent(), frame_bgr, lane_direct=False, speed_cap=slow_speed,
+                cfg=cfg, red_prox=red_prox,
             )
         else:
             state = STATE_CRUISING
@@ -1520,6 +1558,7 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             )
             _drive_leader_wheels(
                 wheels, _get_lane_agent(), frame_bgr, lane_direct=lane_direct, speed_cap=cruise_speed,
+                cfg=cfg, red_prox=red_prox,
             )
 
         if now - last_log >= 2.0:
@@ -1595,6 +1634,8 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     intersection_end = 0.0
     recovery_streak = 0
     recovery_started_at = 0.0
+    last_leader_seen_ts = 0.0
+    intersection_skip_logged = False
 
     while not stop_event.is_set():
         now = time.time()
@@ -1610,6 +1651,8 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             if grid_det is not None and grid_det.found:
                 leader_loss_streak = 0
                 leader_visible = True
+                last_leader_seen_ts = now
+                intersection_skip_logged = False
                 leader_grid_samples = min(leader_grid_samples + 1, 1000)
                 last_distance_signal = grid_det.distance_signal
                 if grid_det.span_px is not None:
@@ -1628,11 +1671,37 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         else:
             line_streak = 0
 
+        skip_intersection = _follower_skip_intersection(cfg, now, last_leader_seen_ts)
+        on_intersection = (
+            intersection_phase is not None
+            or red_prox.at_line
+            or turn_tracker.approach_active
+        )
+        if skip_intersection and on_intersection:
+            if intersection_phase is not None and not intersection_skip_logged:
+                print(
+                    f"[Project][Follower] Leader lost {_follower_leader_lost_s(now, last_leader_seen_ts):.1f}s "
+                    "— skip intersection, lane follow",
+                    flush=True,
+                )
+                intersection_skip_logged = True
+            if intersection_phase is not None:
+                intersection_phase, intersection_direction, line_streak, recovery_streak = (
+                    _follower_abort_intersection(
+                        intersection_phase,
+                        intersection_direction,
+                        line_streak,
+                        turn_tracker,
+                        recovery_streak,
+                    )
+                )
+
         if (
             line_streak >= red_confirm
             and is_driving_enabled()
             and intersection_phase is None
             and turn_tracker.approach_active
+            and not skip_intersection
         ):
             turn_dbg = turn_tracker.debug_votes(cfg)
             intersection_direction = turn_tracker.infer(cfg)
@@ -1731,7 +1800,12 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 print("[Project][Follower] Lane recovered — resume cruise", flush=True)
         else:
             mode = STATE_CRUISING
-            follow_mode = "convoy" if leader_visible else "lane"
+            if skip_intersection and (red_prox.at_line or turn_tracker.approach_active):
+                follow_mode = "lane"
+            elif leader_visible:
+                follow_mode = "convoy"
+            else:
+                follow_mode = "lane"
             target_speed = _follower_cruise_target_speed(
                 spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
                 leader_visible, leader_grid_samples, last_span_px,
@@ -1740,6 +1814,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         commanded_speed = _drive_follower(
             wheels, lane_agent, frame_bgr, commanded_speed, target_speed, frame_dt, cfg, wheel_pwm,
             intersection_pwm=intersection_pwm,
+            lane_kwargs=_project_lane_kwargs(cfg, red_prox) if wheel_pwm is None else None,
         )
 
         if mode != prev_mode:

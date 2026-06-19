@@ -20,8 +20,8 @@ _SLICE_TOL   = 5
 _YELLOW_CENTER_BIAS_PX = 8
 _YELLOW_FAR_SLICE_BIAS_PX = 10
 _WHITE_CENTER_BIAS_PX = 3
-# Project convoy: ignore bottom band where red stop-line paint confuses lane slices.
-_PROJECT_LANE_IGNORE_BOTTOM_FRAC = 0.35
+# Project convoy: optional bottom trim only when wheels are on the red stop line.
+_PROJECT_LANE_IGNORE_BOTTOM_FRAC = 0.0
 
 
 def _largest_component_cols(strip: np.ndarray) -> np.ndarray:

@@ -1,4 +1,4 @@
-role: follower
+role: leader
 
 
 
@@ -11,6 +11,13 @@ sign_source: both
 # Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
 # Follower always scales lane PWM to spacing/commanded speed (keep false on follower bot).
 lane_use_direct_pwm: false
+# Straights: 0 = full yellow/white masks (same as visual_lane_servoing).
+# Bottom band is trimmed only when at_line (see lane_ignore_bottom_at_intersection_frac).
+lane_ignore_bottom_frac: 0.0
+lane_ignore_bottom_at_intersection_frac: 0.35
+# 0 = full masks like visual_lane_servoing; bottom band masked only near red line.
+lane_ignore_bottom_frac: 0.0
+lane_ignore_bottom_at_intersection_frac: 0.35
 
 cruise_speed: 0.40
 
@@ -48,6 +55,9 @@ grid_detect_hz: 10
 # Treat leader as lost after this many consecutive frames without a valid grid (lane follow continues)
 
 leader_loss_confirm_frames: 3
+
+# Leader grid gone this long at/near intersection -> lane follow only (no timed turn).
+follower_intersection_skip_leader_lost_s: 2.5
 
 # Red-line intersection: near band = bottom of frame (lower frac => trigger earlier)
 intersection_red_near_top_frac: 0.65
