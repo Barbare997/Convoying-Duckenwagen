@@ -172,17 +172,6 @@ def test_red_at_line_near_band():
     print("OK: intersection triggers only on near red band")
 
 
-def test_follower_skip_intersection_when_leader_lost():
-    from tasks.project.packages.agent import _follower_skip_intersection
-
-    cfg = {"follower_intersection_skip_leader_lost_s": 2.5}
-    now = 100.0
-    assert not _follower_skip_intersection(cfg, now, 99.0)
-    assert _follower_skip_intersection(cfg, now, 97.4)
-    assert _follower_skip_intersection(cfg, now, 0.0)
-    print("OK: follower skips intersection after leader lost long enough")
-
-
 def test_project_lane_masks_not_cut_on_straight():
     from tasks.project.packages.agent import _project_lane_kwargs
     from tasks.project.packages.intersection_follow import RedLineProximity
@@ -239,9 +228,8 @@ def test_leader_turn_tracker():
         "intersection_cx_drift_px": 20,
         "intersection_heading_thresh": 0.1,
         "intersection_heading_sign": -1.0,
-        "intersection_heading_weak_scale": 0.55,
-        "intersection_aspect_drop_frac": 0.10,
-        "intersection_aspect_baseline_frames": 3,
+        "intersection_straight_aspect_min": 2.2,
+        "intersection_last_cx_offset_px": 20,
         "intersection_turn_infer_lookback": 10,
         "intersection_red_approach_min_far_px": 100,
     }
@@ -256,11 +244,10 @@ def test_leader_turn_tracker():
             True, 0.5, 1.0, None, pat, bbox=wide, center_x=200.0, heading=0.02,
         ))
     for _ in range(6):
-        # Leader yaws right: right grid column taller -> raw heading negative
         tr.update(GridDetection(
             True, 0.5, 1.0, None, pat, bbox=narrow, center_x=200.0, heading=-0.15,
         ))
-    assert tr.infer(cfg) == TURN_RIGHT, "squarer bbox + raw heading<0 => right"
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "last grid heading => right"
 
     tr.reset()
     tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
@@ -270,7 +257,7 @@ def test_leader_turn_tracker():
         tr.update(GridDetection(
             True, 0.5, 1.0, None, pat, bbox=narrow, center_x=200.0, heading=0.15,
         ))
-    assert tr.infer(cfg) == TURN_LEFT, "squarer bbox + raw heading>0 => left"
+    assert tr.infer(cfg, frame_w=640.0) == TURN_LEFT, "last grid heading => left"
 
     tr.reset()
     tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
@@ -278,7 +265,7 @@ def test_leader_turn_tracker():
         tr.update(GridDetection(
             True, 0.5, 1.0, None, pat, bbox=wide, center_x=200.0, heading=0.02,
         ))
-    assert tr.infer(cfg) == TURN_STRAIGHT, "wide stable bbox => straight"
+    assert tr.infer(cfg, frame_w=640.0) == TURN_STRAIGHT, "wide stable last grid => straight"
 
     tr.reset()
     tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
@@ -286,9 +273,39 @@ def test_leader_turn_tracker():
         tr.update(GridDetection(
             True, 0.5, 1.0, None, pat, bbox=wide, center_x=float(cx), heading=0.02,
         ))
-    assert tr.infer(cfg) == TURN_STRAIGHT, "cx drift without aspect drop or heading => straight"
+    assert tr.infer(cfg, frame_w=640.0) == TURN_STRAIGHT, "cx drift alone without heading => straight"
+
+    tr.reset()
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    for cx in range(280, 380, 8):
+        tr.update(GridDetection(
+            True, 0.5, 0.8, None, pat, bbox=(int(cx) - 40, 60, int(cx) + 40, 140),
+            center_x=float(cx), source="blue",
+        ))
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "blue center drift => right"
 
     print("OK: leader turn tracker")
+
+
+def test_leader_blue_detection():
+    from tasks.project.packages.leader_blue import detect_leader_blue
+
+    cfg = {
+        "role": "follower",
+        "leader_blue_enabled": True,
+        "leader_blue_h_min": 95,
+        "leader_blue_h_max": 130,
+        "leader_blue_s_min": 60,
+        "leader_blue_v_min": 35,
+        "leader_blue_min_area": 400,
+    }
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (260, 70), (380, 170), (200, 90, 0), -1)
+    det = detect_leader_blue(frame, cfg)
+    assert det.found, "blue duckie blob should be detected"
+    assert det.source == "blue"
+    assert det.center_x is not None and det.span_px is not None
+    print("OK: leader blue detection")
 
 
 def test_role_dispatch():
@@ -563,9 +580,9 @@ if __name__ == "__main__":
     test_grid_spacing_controller()
     test_red_at_line_near_band()
     test_project_lane_masks_not_cut_on_straight()
-    test_follower_skip_intersection_when_leader_lost()
     test_lane_ignore_red_for_convoy()
     test_leader_turn_tracker()
+    test_leader_blue_detection()
     test_follower_cruise_target_speed_startup()
     test_intersection_arc_pwm_not_scaled_by_cruise()
     test_slow_sign_delay()

@@ -11,9 +11,8 @@ import yaml
 from tasks.project.packages.follower_spacing import GridSpacingController
 from tasks.project.packages.intersection_follow import (
     LeaderTurnTracker,
-    intersection_turn_duration,
+    intersection_turn_schedule,
     intersection_wheel_commands,
-    lane_frame_ok_for_recovery,
     measure_red_at_line,
     TURN_LEFT,
     TURN_RIGHT,
@@ -23,8 +22,10 @@ from tasks.project.packages.leader_grid import (
     GridDetection,
     draw_grid_overlay,
     fetch_leader_grid,
+    fetch_leader_tracking,
     get_cached_grid_detection,
 )
+from tasks.project.packages.leader_blue import draw_blue_overlay, leader_spacing_span_px
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
  
 _CONFIG_PATH = os.path.normpath(
@@ -104,9 +105,6 @@ def load_config() -> Dict[str, Any]:
         "follower_spacing_warmup_frames": int(cfg.get("follower_spacing_warmup_frames", 8)),
         "follower_catchup_margin": float(cfg.get("follower_catchup_margin", 0.06)),
         "follower_lane_fallback_speed": float(cfg.get("follower_lane_fallback_speed", 0.15)),
-        "follower_intersection_skip_leader_lost_s": float(
-            cfg.get("follower_intersection_skip_leader_lost_s", 2.5)
-        ),
         "span_target_px": float(cfg.get("span_target_px", 32.0)),
         "spacing_kp": float(cfg.get("spacing_kp", 0.010)),
         "spacing_kd": float(cfg.get("spacing_kd", 0.018)),
@@ -134,6 +132,23 @@ def load_config() -> Dict[str, Any]:
         "grid_blob_min_circularity": float(cfg.get("grid_blob_min_circularity", 0.6)),
         "grid_safe_px": float(cfg.get("grid_safe_px", 20.0)),
         "grid_stop_px": float(cfg.get("grid_stop_px", 42.0)),
+        "leader_blue_enabled": bool(cfg.get("leader_blue_enabled", True)),
+        "leader_blue_h_min": int(cfg.get("leader_blue_h_min", 95)),
+        "leader_blue_h_max": int(cfg.get("leader_blue_h_max", 130)),
+        "leader_blue_s_min": int(cfg.get("leader_blue_s_min", 60)),
+        "leader_blue_v_min": int(cfg.get("leader_blue_v_min", 35)),
+        "leader_blue_roi_top_frac": float(cfg.get("leader_blue_roi_top_frac", 0.05)),
+        "leader_blue_roi_bottom_frac": float(cfg.get("leader_blue_roi_bottom_frac", 0.82)),
+        "leader_blue_min_area": float(cfg.get("leader_blue_min_area", 600.0)),
+        "leader_blue_max_area": float(cfg.get("leader_blue_max_area", 90000.0)),
+        "leader_blue_morph_kernel": int(cfg.get("leader_blue_morph_kernel", 5)),
+        "leader_blue_span_scale": float(cfg.get("leader_blue_span_scale", 0.55)),
+        "leader_blue_span_target_px": float(cfg.get("leader_blue_span_target_px", 36.0)),
+        "leader_blue_safe_px": float(cfg.get("leader_blue_safe_px", 14.0)),
+        "leader_blue_stop_px": float(cfg.get("leader_blue_stop_px", 50.0)),
+        "intersection_blue_straight_center_px": float(
+            cfg.get("intersection_blue_straight_center_px", 18.0)
+        ),
         "stop_hold_s": float(cfg.get("stop_hold_s", 2.0)),
         "slow_hold_s": float(cfg.get("slow_hold_s", 4.0)),
         "decel_time_s": float(cfg.get("decel_time_s", 1.2)),
@@ -181,25 +196,19 @@ def load_config() -> Dict[str, Any]:
         "intersection_turn_track_window": int(cfg.get("intersection_turn_track_window", 20)),
         "intersection_turn_infer_lookback": int(cfg.get("intersection_turn_infer_lookback", 8)),
         "intersection_cx_drift_px": float(cfg.get("intersection_cx_drift_px", 30.0)),
-        "intersection_cx_drift_weak_scale": float(cfg.get("intersection_cx_drift_weak_scale", 0.5)),
         "intersection_heading_thresh": float(cfg.get("intersection_heading_thresh", 0.12)),
         "intersection_heading_sign": float(cfg.get("intersection_heading_sign", -1.0)),
-        "intersection_heading_weak_scale": float(cfg.get("intersection_heading_weak_scale", 0.55)),
-        "intersection_aspect_drop_frac": float(cfg.get("intersection_aspect_drop_frac", 0.10)),
-        "intersection_aspect_baseline_frames": int(cfg.get("intersection_aspect_baseline_frames", 4)),
+        "intersection_straight_aspect_min": float(cfg.get("intersection_straight_aspect_min", 2.2)),
+        "intersection_last_cx_offset_px": float(cfg.get("intersection_last_cx_offset_px", 28.0)),
         "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
-        "intersection_turn_delay_s": float(cfg.get("intersection_turn_delay_s", 2.0)),
         "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
         "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
+        "intersection_left_preamble_s": float(cfg.get("intersection_left_preamble_s", 0.55)),
+        "intersection_right_preamble_s": float(cfg.get("intersection_right_preamble_s", 0.35)),
         "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.2)),
         "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 1.8)),
         "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.8)),
         "intersection_turn_tail_straight_s": float(cfg.get("intersection_turn_tail_straight_s", 1.6)),
-        "intersection_recovery_min_s": float(cfg.get("intersection_recovery_min_s", 2.8)),
-        "intersection_recovery_lane_frames": int(cfg.get("intersection_recovery_lane_frames", 20)),
-        "intersection_recovery_min_lane_px": int(cfg.get("intersection_recovery_min_lane_px", 700)),
-        "intersection_recovery_max_red_px": int(cfg.get("intersection_recovery_max_red_px", 500)),
-        "intersection_recovery_require_clear_red": bool(cfg.get("intersection_recovery_require_clear_red", True)),
     }
 
 
@@ -1215,16 +1224,18 @@ def detect_sign_event(
 
 
 def get_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]) -> Optional[GridDetection]:
-    """Shared grid detect + cache for MJPEG preview."""
+    """Shared leader tracking detect + cache for MJPEG preview."""
     if frame_bgr is None:
         return get_cached_grid_detection()
-    return fetch_leader_grid(frame_bgr, cfg)
+    return fetch_leader_tracking(frame_bgr, cfg)
 
 
 def render_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]):
     det = get_follower_grid_overlay(frame_bgr, cfg)
     if det is None or not det.found:
         return frame_bgr
+    if det.source == "blue":
+        return draw_blue_overlay(frame_bgr, det)
     return draw_grid_overlay(frame_bgr, det)
 
 
@@ -1270,30 +1281,6 @@ def _project_lane_kwargs(cfg, red_prox=None):
             float(cfg.get("lane_ignore_bottom_at_intersection_frac", 0.35)),
         )
     return {"ignore_bottom_frac": ignore, "debug_red_mask": True}
-
-
-def _follower_leader_lost_s(now, last_leader_seen_ts):
-    if last_leader_seen_ts <= 0:
-        return float("inf")
-    return max(0.0, float(now) - float(last_leader_seen_ts))
-
-
-def _follower_skip_intersection(cfg, now, last_leader_seen_ts):
-    """No timed turns when leader grid has been gone long enough — lane follow only."""
-    lost_s = _follower_leader_lost_s(now, last_leader_seen_ts)
-    return lost_s >= float(cfg.get("follower_intersection_skip_leader_lost_s", 2.5))
-
-
-def _follower_abort_intersection(
-    intersection_phase,
-    intersection_direction,
-    line_streak,
-    turn_tracker,
-    recovery_streak,
-):
-    """Clear intersection state and return reset values."""
-    turn_tracker.reset()
-    return None, None, 0, 0
 
 
 def _leader_lane_pwm(lane_agent, frame_bgr, cfg=None, red_prox=None):
@@ -1422,6 +1409,12 @@ def _follower_cruise_target_speed(
             float(cfg.get("span_too_close_speed", 0.06)),
         )
     return max(follower_min, min(follower_max, target_speed))
+
+
+def _follower_intersection_turn_speed(cfg, cruise_speed):
+    """Fixed PWM base during timed intersection — not spacing/throttle."""
+    turn = float(cfg.get("intersection_turn_speed", cruise_speed))
+    return min(1.0, max(0.05, turn))
 
 
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
@@ -1595,7 +1588,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     print("[Project][Follower] Lane control: one update per camera frame (like visual_lane_servoing).")
     print(
         f"[Project][Follower] span_target={span_target:.0f}px; "
-        f"red-line intersection ({int(cfg.get('grid_cols', 7))}x{int(cfg.get('grid_rows', 3))} grid at {grid_hz:.1f} Hz).",
+        f"red-line intersection ({int(cfg.get('grid_cols', 7))}x{int(cfg.get('grid_rows', 3))} grid + blue fallback at {grid_hz:.1f} Hz).",
         flush=True,
     )
 
@@ -1613,15 +1606,13 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     last_distance_signal = None
     last_span_px = None
     line_streak = 0
-    intersection_phase = None  # None | "TURN" | "RECOVERY"
+    intersection_phase = None  # None | "TURN"
     intersection_direction = None
-    intersection_arc_start = 0.0
+    intersection_turn_start = 0.0
+    intersection_preamble_end = 0.0
     intersection_arc_end = 0.0
     intersection_end = 0.0
-    recovery_streak = 0
-    recovery_started_at = 0.0
     last_leader_seen_ts = 0.0
-    intersection_skip_logged = False
 
     while not stop_event.is_set():
         now = time.time()
@@ -1633,19 +1624,20 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         turn_tracker.begin_approach_if_needed(red_prox, cfg)
 
         if now - last_grid >= grid_dt:
-            grid_det = fetch_leader_grid(frame_bgr, cfg) if frame_bgr is not None else None
-            if grid_det is not None and grid_det.found:
+            leader_det = fetch_leader_tracking(frame_bgr, cfg) if frame_bgr is not None else None
+            if leader_det is not None and leader_det.found:
                 leader_loss_streak = 0
                 leader_visible = True
                 last_leader_seen_ts = now
-                intersection_skip_logged = False
                 leader_grid_samples = min(leader_grid_samples + 1, 1000)
-                last_distance_signal = grid_det.distance_signal
-                if grid_det.span_px is not None:
-                    last_span_px = float(grid_det.span_px)
-                    spacing.observe(last_span_px, now, cfg, commanded_speed)
+                last_distance_signal = leader_det.distance_signal
+                if leader_det.span_px is not None:
+                    spacing_span = leader_spacing_span_px(leader_det, cfg)
+                    if spacing_span is not None:
+                        last_span_px = spacing_span
+                        spacing.observe(spacing_span, now, cfg, commanded_speed)
                 if turn_tracker.approach_active:
-                    turn_tracker.update(grid_det)
+                    turn_tracker.update(leader_det)
             else:
                 leader_loss_streak += 1
                 if leader_loss_streak >= loss_confirm:
@@ -1657,57 +1649,30 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         else:
             line_streak = 0
 
-        skip_intersection = _follower_skip_intersection(cfg, now, last_leader_seen_ts)
-        on_intersection = (
-            intersection_phase is not None
-            or red_prox.at_line
-            or turn_tracker.approach_active
-        )
-        if skip_intersection and on_intersection:
-            if intersection_phase is not None and not intersection_skip_logged:
-                print(
-                    f"[Project][Follower] Leader lost {_follower_leader_lost_s(now, last_leader_seen_ts):.1f}s "
-                    "— skip intersection, lane follow",
-                    flush=True,
-                )
-                intersection_skip_logged = True
-            if intersection_phase is not None:
-                intersection_phase, intersection_direction, line_streak, recovery_streak = (
-                    _follower_abort_intersection(
-                        intersection_phase,
-                        intersection_direction,
-                        line_streak,
-                        turn_tracker,
-                        recovery_streak,
-                    )
-                )
-
         if (
             line_streak >= red_confirm
             and is_driving_enabled()
             and intersection_phase is None
             and turn_tracker.approach_active
-            and not skip_intersection
         ):
-            turn_dbg = turn_tracker.debug_votes(cfg)
-            intersection_direction = turn_tracker.infer(cfg)
+            frame_w = float(frame_bgr.shape[1]) if frame_bgr is not None else 640.0
+            turn_dbg = turn_tracker.debug_votes(cfg, frame_w=frame_w)
+            intersection_direction = turn_tracker.infer(cfg, frame_w=frame_w)
             intersection_phase = "TURN"
-            arc_s = intersection_turn_duration(intersection_direction, cfg)
-            tail_s = max(0.0, float(cfg.get("intersection_turn_tail_straight_s", 1.6)))
-            delay_s = 0.0
-            if intersection_direction in (TURN_LEFT, TURN_RIGHT):
-                delay_s = max(0.0, float(cfg.get("intersection_turn_delay_s", 2.0)))
-            intersection_arc_start = now + delay_s
-            intersection_arc_end = intersection_arc_start + arc_s
-            intersection_end = intersection_arc_end + tail_s
-            recovery_streak = 0
+            schedule = intersection_turn_schedule(intersection_direction, cfg)
+            intersection_turn_start = now
+            intersection_preamble_end = now + schedule["preamble_s"]
+            intersection_arc_end = intersection_preamble_end + schedule["arc_s"]
+            intersection_end = intersection_arc_end + schedule["tail_s"]
             print(
                 f"[Project][Follower] Red line — turn {intersection_direction} "
-                f"(yawing={turn_dbg['yawing']} aspect_drop={turn_dbg['aspect_drop_frac']:.2f} "
-                f"aspect={turn_dbg['aspect_baseline']:.2f}->{turn_dbg['aspect_recent']:.2f} "
-                f"cx_drift={turn_dbg['cx_drift']:.0f}px cx={turn_dbg['cx_vote']} "
-                f"heading={turn_dbg['heading_vote']}; near_px={red_prox.near_px}) "
-                f"wait={delay_s:.1f}s arc={arc_s:.1f}s tail={tail_s:.1f}s",
+                f"(last={turn_dbg['last_source']} "
+                f"cx={turn_dbg['last_cx']} hdg={turn_dbg['last_heading']} "
+                f"aspect={turn_dbg['last_aspect']} offset={turn_dbg['cx_offset_px']:.0f}px "
+                f"hdg_vote={turn_dbg['heading_vote']} trend={turn_dbg['cx_trend_vote']}; "
+                f"near_px={red_prox.near_px}) "
+                f"preamble={schedule['preamble_s']:.1f}s "
+                f"arc={schedule['arc_s']:.1f}s tail={schedule['tail_s']:.1f}s",
                 flush=True,
             )
 
@@ -1718,55 +1683,48 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
 
         if intersection_phase == "TURN":
             mode = STATE_INTERSECTION
-            target_speed = _follower_cruise_target_speed(
-                spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
-                leader_visible, leader_grid_samples, last_span_px,
-            )
-            if (
-                intersection_direction in (TURN_LEFT, TURN_RIGHT)
-                and now < intersection_arc_start
-            ):
-                # Pre-arc delay: keep normal cruise lane follow (no stop on red line).
-                wheel_pwm = None
-                follow_mode = f"turn_wait_{intersection_direction}"
-            else:
-                in_tail = now >= intersection_arc_end
-                drive_dir = TURN_STRAIGHT if in_tail else intersection_direction
-                wheel_pwm = intersection_wheel_commands(drive_dir, cfg, speed=target_speed)
+            turn_speed = _follower_intersection_turn_speed(cfg, cruise_speed)
+            target_speed = turn_speed
+            if intersection_direction == TURN_STRAIGHT:
+                wheel_pwm = intersection_wheel_commands(
+                    TURN_STRAIGHT, cfg, speed=turn_speed,
+                )
                 intersection_pwm = True
-                follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
+                follow_mode = "turn_straight"
+            elif now < intersection_preamble_end:
+                wheel_pwm = intersection_wheel_commands(
+                    TURN_STRAIGHT, cfg, speed=turn_speed,
+                )
+                intersection_pwm = True
+                follow_mode = f"turn_preamble_{intersection_direction}"
+            elif now < intersection_arc_end:
+                wheel_pwm = intersection_wheel_commands(
+                    intersection_direction, cfg, speed=turn_speed,
+                )
+                intersection_pwm = True
+                follow_mode = f"turn_{intersection_direction}"
+            elif now < intersection_end:
+                wheel_pwm = intersection_wheel_commands(
+                    TURN_STRAIGHT, cfg, speed=turn_speed,
+                )
+                intersection_pwm = True
+                follow_mode = "turn_tail"
             if now >= intersection_end:
-                intersection_phase = "RECOVERY"
-                recovery_streak = 0
-                recovery_started_at = now
-                print("[Project][Follower] Turn done — lane recovery", flush=True)
-        elif intersection_phase == "RECOVERY":
-            mode = STATE_INTERSECTION
-            follow_mode = "recovery"
-            target_speed = _follower_cruise_target_speed(
-                spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
-                leader_visible, leader_grid_samples, last_span_px,
-            )
-            recovery_min_s = float(cfg.get("intersection_recovery_min_s", 2.8))
-            require_clear_red = bool(cfg.get("intersection_recovery_require_clear_red", True))
-            if (now - recovery_started_at) >= recovery_min_s:
-                red_clear = (not red_prox.at_line) if require_clear_red else True
-                if red_clear and lane_frame_ok_for_recovery(lane_agent, cfg):
-                    recovery_streak += 1
-                else:
-                    recovery_streak = 0
-            if recovery_streak >= max(1, int(cfg.get("intersection_recovery_lane_frames", 20))):
                 intersection_phase = None
                 intersection_direction = None
                 line_streak = 0
                 turn_tracker.reset()
-                recovery_streak = 0
-                print("[Project][Follower] Lane recovered — resume cruise", flush=True)
+                mode = STATE_CRUISING
+                wheel_pwm = None
+                intersection_pwm = False
+                if leader_visible:
+                    follow_mode = "convoy"
+                else:
+                    follow_mode = "lane"
+                print("[Project][Follower] Intersection done — resume cruise", flush=True)
         else:
             mode = STATE_CRUISING
-            if skip_intersection and (red_prox.at_line or turn_tracker.approach_active):
-                follow_mode = "lane"
-            elif leader_visible:
+            if leader_visible:
                 follow_mode = "convoy"
             else:
                 follow_mode = "lane"

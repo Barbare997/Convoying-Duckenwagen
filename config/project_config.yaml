@@ -53,9 +53,6 @@ grid_detect_hz: 10
 
 leader_loss_confirm_frames: 3
 
-# Leader grid gone this long at/near intersection -> lane follow only (no timed turn).
-follower_intersection_skip_leader_lost_s: 2.5
-
 # Red-line intersection: near band = bottom of frame (lower frac => trigger earlier)
 intersection_red_near_top_frac: 0.65
 intersection_red_far_top_frac: 0.35
@@ -66,31 +63,24 @@ intersection_red_confirm_frames: 2
 intersection_red_approach_min_far_px: 600
 intersection_turn_track_window: 20
 intersection_turn_infer_lookback: 8
-# Turn inference: bbox gets squarer (width shrinks) when leader yaws; center often stays mid-frame.
-intersection_aspect_drop_frac: 0.10
-intersection_aspect_baseline_frames: 4
+# Last-seen grid: wide face-on aspect + weak heading => straight.
+intersection_straight_aspect_min: 2.2
+intersection_last_cx_offset_px: 28
 intersection_cx_drift_px: 30
-intersection_cx_drift_weak_scale: 0.5
 intersection_heading_thresh: 0.12
 # Flip raw grid heading onto turn direction: leader right yaw -> right column taller -> raw h<0 -> turn right.
 intersection_heading_sign: -1.0
-intersection_heading_weak_scale: 0.55
-# Fallback arc speed if cruise target unavailable; TURN uses live spacing/cruise speed.
+# Fixed intersection PWM (straight + arc); not throttled by spacing/blue fallback.
 intersection_turn_speed: 0.40
-# Optional pause before left/right arc (0 = start arc immediately at cruise speed).
-intersection_turn_delay_s: 0
-intersection_turn_inner_ratio: 0.4
-intersection_turn_outer_ratio: 0.7
+intersection_turn_inner_ratio: 0.42
+intersection_turn_outer_ratio: 0.68
+# Left/right: blind straight into the intersection, then timed arc (~90 deg at 2.0s; lower = less yaw).
+intersection_left_preamble_s: 0.55
+intersection_right_preamble_s: 0.35
 intersection_turn_straight_s: 1.4
-intersection_turn_left_s: 2.1
-intersection_turn_right_s: 2.1
-# Extra straight driving at end of TURN (same phase, after arc timer)
-intersection_turn_tail_straight_s: 1.6
-intersection_recovery_min_s: 1.5
-intersection_recovery_lane_frames: 12
-intersection_recovery_min_lane_px: 700
-intersection_recovery_max_red_px: 800
-intersection_recovery_require_clear_red: true
+intersection_turn_left_s: 1.70
+intersection_turn_right_s: 1.60
+intersection_turn_tail_straight_s: 0.0
 
 
 # Leader rear dot grid (7 columns x 3 rows, black dots on white)
@@ -117,6 +107,23 @@ grid_blob_min_circularity: 0.6
 # Wider stop-safe gap = signal rises slower as you approach the leader.
 grid_safe_px: 18
 grid_stop_px: 48
+
+# Blue duckie body fallback when rear dot grid is too small / lost (real bots).
+leader_blue_enabled: true
+leader_blue_h_min: 95
+leader_blue_h_max: 130
+leader_blue_s_min: 60
+leader_blue_v_min: 35
+leader_blue_roi_top_frac: 0.05
+leader_blue_roi_bottom_frac: 0.82
+leader_blue_min_area: 600
+leader_blue_max_area: 90000
+leader_blue_span_scale: 0.55
+# Desired blue span_px at follow gap (higher = follow closer). Grid uses span_target_px above.
+leader_blue_span_target_px: 38
+leader_blue_safe_px: 14
+leader_blue_stop_px: 50
+intersection_blue_straight_center_px: 18
 
 
 slow_hold_s: 4.0

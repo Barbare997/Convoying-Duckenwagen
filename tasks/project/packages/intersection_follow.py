@@ -46,142 +46,169 @@ def grid_bbox_aspect(det: GridDetection) -> Optional[float]:
     return w / h
 
 
+class _LastLeaderSample(object):
+    __slots__ = ("center_x", "heading", "aspect", "source")
+
+    def __init__(self, center_x, heading, aspect, source):
+        self.center_x = center_x
+        self.heading = heading
+        self.aspect = aspect
+        self.source = source
+
+
 class LeaderTurnTracker(object):
-    """Guess leader turn from rear-grid shape during red-line approach.
+    """Remember last leader sighting during red approach; infer turn from it.
 
-    Primary cue: bbox aspect ratio drops (grid becomes squarer / narrower) when the
-    leader yaws — center x often stays near the image middle while following.
-
-    Direction: perspective heading (left vs right dot-column height), then weaker
-    heading / cx drift as fallbacks once yaw is confirmed.
+    Grid gives heading when visible; blue body center-x is kept when the grid
+    drops out (common right as the leader yaws at an intersection).
     """
 
     def __init__(self, window=20):
         self._window = max(3, int(window))
         self._cx = deque(maxlen=self._window)  # type: Deque[float]
-        self._headings = deque(maxlen=self._window)  # type: Deque[float]
-        self._aspects = deque(maxlen=self._window)  # type: Deque[float]
+        self._last = None  # type: Optional[_LastLeaderSample]
         self._approach_active = False
 
     def reset(self):
         self._cx.clear()
-        self._headings.clear()
-        self._aspects.clear()
+        self._last = None
         self._approach_active = False
 
     def update(self, det):
         if not det.found:
             return
         if det.center_x is not None:
-            self._cx.append(float(det.center_x))
+            cx = float(det.center_x)
         elif det.centers is not None and len(det.centers) > 0:
-            self._cx.append(float(det.centers[0, 0, 0]))
-        if det.heading is not None:
-            self._headings.append(float(det.heading))
+            cx = float(det.centers[0, 0, 0])
+        else:
+            return
+        self._cx.append(cx)
         aspect = grid_bbox_aspect(det)
-        if aspect is not None:
-            self._aspects.append(aspect)
+        source = getattr(det, "source", None) or ("grid" if det.heading is not None else "blue")
+        if source == "grid" and det.heading is not None:
+            heading = float(det.heading)
+            self._last = _LastLeaderSample(cx, heading, aspect, "grid")
+        else:
+            self._last = _LastLeaderSample(cx, None, aspect, "blue")
 
     def begin_approach_if_needed(self, red_prox, cfg):
-        """Clear stale cruise samples when red first shows in the far band."""
+        """Clear stale samples when red first shows in the far band."""
         min_far = int(cfg.get("intersection_red_approach_min_far_px", 600))
         approaching = red_prox.far_px >= min_far
         if approaching and not self._approach_active:
             self._cx.clear()
-            self._headings.clear()
-            self._aspects.clear()
+            self._last = None
         self._approach_active = approaching
 
     @property
     def approach_active(self):
         return self._approach_active
 
-    def _cx_drift(self, cfg):
-        lookback = max(3, int(cfg.get("intersection_turn_infer_lookback", 8)))
-        samples = list(self._cx)
-        if len(samples) < 3:
-            return 0.0
-        recent = samples[-min(lookback, len(samples)):]
-        return recent[-1] - recent[0]
+    @property
+    def has_last_grid(self):
+        return self._last is not None
 
-    def _cx_vote(self, drift, cfg, scale=1.0):
-        thresh = float(cfg.get("intersection_cx_drift_px", 30.0)) * float(scale)
-        if drift >= thresh:
-            return TURN_RIGHT
-        if drift <= -thresh:
-            return TURN_LEFT
-        return TURN_STRAIGHT
-
-    def _heading_vote(self, cfg, scale=1.0):
-        if len(self._headings) < 3:
+    def _heading_turn(self, heading, cfg):
+        if heading is None:
             return TURN_STRAIGHT
-        thresh = float(cfg.get("intersection_heading_thresh", 0.12)) * float(scale)
+        thresh = float(cfg.get("intersection_heading_thresh", 0.12))
         sign = float(cfg.get("intersection_heading_sign", -1.0))
-        h = sign * float(np.mean(list(self._headings)[-5:]))
+        h = sign * float(heading)
         if h >= thresh:
             return TURN_RIGHT
         if h <= -thresh:
             return TURN_LEFT
         return TURN_STRAIGHT
 
-    def _aspect_drop_frac(self, cfg) -> Tuple[float, float, float]:
-        """Return (fractional_drop, baseline_aspect, recent_aspect)."""
-        aspects = list(self._aspects)
-        if len(aspects) < 3:
-            return 0.0, 0.0, 0.0
-        n_base = max(2, int(cfg.get("intersection_aspect_baseline_frames", 4)))
-        baseline = float(np.mean(aspects[: min(n_base, len(aspects))]))
-        lookback = max(2, int(cfg.get("intersection_turn_infer_lookback", 8)))
-        recent = float(np.mean(aspects[-min(lookback, len(aspects)) :]))
-        if baseline < 1e-3:
-            return 0.0, baseline, recent
-        drop = max(0.0, (baseline - recent) / baseline)
-        return drop, baseline, recent
-
-    def _is_yawing(self, drop_frac: float, cfg) -> bool:
-        return drop_frac >= float(cfg.get("intersection_aspect_drop_frac", 0.10))
-
-    def infer(self, cfg):
-        drop_frac, _baseline, _recent = self._aspect_drop_frac(cfg)
-        yawing = self._is_yawing(drop_frac, cfg)
-
-        if not yawing:
-            drift = self._cx_drift(cfg)
-            cx_vote = self._cx_vote(drift, cfg)
-            heading_vote = self._heading_vote(cfg)
-            if cx_vote == heading_vote and cx_vote != TURN_STRAIGHT:
-                return cx_vote
+    def _cx_trend_turn(self, cfg):
+        if len(self._cx) < 3:
             return TURN_STRAIGHT
-
-        heading_vote = self._heading_vote(cfg, scale=1.0)
-        if heading_vote != TURN_STRAIGHT:
-            return heading_vote
-
-        weak = float(cfg.get("intersection_heading_weak_scale", 0.55))
-        heading_weak = self._heading_vote(cfg, scale=weak)
-        if heading_weak != TURN_STRAIGHT:
-            return heading_weak
-
-        cx_weak = float(cfg.get("intersection_cx_drift_weak_scale", 0.5))
-        drift = self._cx_drift(cfg)
-        cx_vote = self._cx_vote(drift, cfg, scale=cx_weak)
-        if cx_vote != TURN_STRAIGHT:
-            return cx_vote
-
+        lookback = max(2, int(cfg.get("intersection_turn_infer_lookback", 8)))
+        samples = list(self._cx)[-min(lookback, len(self._cx)) :]
+        drift = float(samples[-1] - samples[0])
+        thresh = float(cfg.get("intersection_cx_drift_px", 30.0))
+        if drift >= thresh:
+            return TURN_RIGHT
+        if drift <= -thresh:
+            return TURN_LEFT
         return TURN_STRAIGHT
 
-    def debug_votes(self, cfg):
-        drift = self._cx_drift(cfg)
-        drop_frac, baseline, recent = self._aspect_drop_frac(cfg)
-        yawing = self._is_yawing(drop_frac, cfg)
+    def _infer_from_center(self, last, cfg, frame_w):
+        cx_offset_thresh = float(cfg.get("intersection_last_cx_offset_px", 28.0))
+        straight_center = float(cfg.get("intersection_blue_straight_center_px", 18.0))
+        offset = float(last.center_x) - (frame_w / 2.0)
+        if abs(offset) <= straight_center:
+            trend_vote = self._cx_trend_turn(cfg)
+            if trend_vote == TURN_STRAIGHT:
+                return TURN_STRAIGHT
+        if offset >= cx_offset_thresh:
+            return TURN_RIGHT
+        if offset <= -cx_offset_thresh:
+            return TURN_LEFT
+        trend_vote = self._cx_trend_turn(cfg)
+        if trend_vote != TURN_STRAIGHT:
+            return trend_vote
+        return TURN_STRAIGHT
+
+    def infer(self, cfg, frame_w=640.0):
+        """Use the last leader sighting to pick straight / left / right."""
+        last = self._last
+        if last is None:
+            return TURN_STRAIGHT
+
+        frame_w = max(1.0, float(frame_w))
+        straight_aspect = float(cfg.get("intersection_straight_aspect_min", 2.2))
+        heading_thresh = float(cfg.get("intersection_heading_thresh", 0.12))
+
+        if last.source == "grid" and last.heading is not None:
+            # Face-on grid + weak heading on the last frame -> straight through.
+            if last.aspect is not None and last.aspect >= straight_aspect:
+                if abs(float(last.heading)) < heading_thresh * 0.45:
+                    return TURN_STRAIGHT
+
+            heading_vote = self._heading_turn(last.heading, cfg)
+            if heading_vote != TURN_STRAIGHT:
+                return heading_vote
+
+        return self._infer_from_center(last, cfg, frame_w)
+
+    def debug_votes(self, cfg, frame_w=640.0):
+        last = self._last
+        frame_w = max(1.0, float(frame_w))
+        if last is None:
+            return {
+                "has_last_grid": False,
+                "last_source": None,
+                "last_cx": None,
+                "last_heading": None,
+                "last_aspect": None,
+                "cx_offset_px": 0.0,
+                "heading_vote": TURN_STRAIGHT,
+                "cx_trend_vote": TURN_STRAIGHT,
+                "infer": TURN_STRAIGHT,
+            }
+        cx_offset = float(last.center_x) - (frame_w / 2.0)
+        heading_vote = (
+            self._heading_turn(last.heading, cfg)
+            if last.source == "grid" and last.heading is not None
+            else TURN_STRAIGHT
+        )
+        trend_vote = self._cx_trend_turn(cfg)
         return {
-            "cx_drift": drift,
-            "cx_vote": self._cx_vote(drift, cfg),
-            "heading_vote": self._heading_vote(cfg),
-            "aspect_baseline": baseline,
-            "aspect_recent": recent,
-            "aspect_drop_frac": drop_frac,
-            "yawing": yawing,
+            "has_last_grid": True,
+            "last_source": last.source,
+            "last_cx": round(float(last.center_x), 1),
+            "last_heading": (
+                round(float(last.heading), 3) if last.heading is not None else None
+            ),
+            "last_aspect": (
+                round(float(last.aspect), 2) if last.aspect is not None else None
+            ),
+            "cx_offset_px": round(cx_offset, 1),
+            "heading_vote": heading_vote,
+            "cx_trend_vote": trend_vote,
+            "infer": self.infer(cfg, frame_w=frame_w),
         }
 
 
@@ -249,13 +276,31 @@ def measure_red_at_line(frame_bgr, cfg):
     )
 
 
-def intersection_turn_duration(direction, cfg):
-    key = {
-        TURN_STRAIGHT: "intersection_turn_straight_s",
-        TURN_LEFT: "intersection_turn_left_s",
-        TURN_RIGHT: "intersection_turn_right_s",
-    }.get(direction, "intersection_turn_straight_s")
-    return max(0.2, float(cfg.get(key, 1.5)))
+def intersection_turn_schedule(direction, cfg):
+    """Return preamble (straight), arc (~90 deg), and optional tail seconds."""
+    if direction == TURN_STRAIGHT:
+        return {
+            "preamble_s": 0.0,
+            "arc_s": max(0.2, float(cfg.get("intersection_turn_straight_s", 1.4))),
+            "tail_s": 0.0,
+        }
+    if direction == TURN_RIGHT:
+        return {
+            "preamble_s": max(0.0, float(cfg.get("intersection_right_preamble_s", 0.35))),
+            "arc_s": max(0.2, float(cfg.get("intersection_turn_right_s", 2.0))),
+            "tail_s": max(0.0, float(cfg.get("intersection_turn_tail_straight_s", 0.0))),
+        }
+    if direction == TURN_LEFT:
+        return {
+            "preamble_s": max(0.0, float(cfg.get("intersection_left_preamble_s", 0.55))),
+            "arc_s": max(0.2, float(cfg.get("intersection_turn_left_s", 2.1))),
+            "tail_s": max(0.0, float(cfg.get("intersection_turn_tail_straight_s", 0.0))),
+        }
+    return {
+        "preamble_s": 0.0,
+        "arc_s": max(0.2, float(cfg.get("intersection_turn_straight_s", 1.4))),
+        "tail_s": 0.0,
+    }
 
 
 def intersection_wheel_commands(direction, cfg, speed=None):
@@ -274,25 +319,3 @@ def intersection_wheel_commands(direction, cfg, speed=None):
     if direction == TURN_RIGHT:
         return outer, inner
     return turn_speed, turn_speed
-
-
-def lane_frame_ok_for_recovery(lane_agent, cfg):
-    """True when yellow/white are back and red paint is mostly behind us."""
-    debug = getattr(lane_agent, "last_debug_info", None) or {}
-    if not debug.get("lane_detected"):
-        return False
-    yellow_px = int(np.count_nonzero(debug.get("yellow_mask", 0)))
-    white_px = int(np.count_nonzero(debug.get("white_mask", 0)))
-    red_px = int(np.count_nonzero(debug.get("red_mask", 0)))
-    min_lane = int(cfg.get("intersection_recovery_min_lane_px", 400))
-    max_red = int(cfg.get("intersection_recovery_max_red_px", 800))
-    min_lane_frac = float(cfg.get("intersection_recovery_min_lane_frac", 0.0))
-    if min_lane_frac > 0.0:
-        h, w = debug.get("yellow_mask", np.zeros((1, 1))).shape[:2]
-        if yellow_px + white_px < int(h * w * min_lane_frac):
-            return False
-    elif yellow_px + white_px < min_lane:
-        return False
-    if red_px > max_red:
-        return False
-    return True

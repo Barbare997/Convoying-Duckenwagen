@@ -15,7 +15,7 @@ class GridDetection(object):
 
     __slots__ = (
         "found", "distance_signal", "quality", "centers", "pattern_size",
-        "span_px", "bbox", "heading", "center_x",
+        "span_px", "bbox", "heading", "center_x", "source",
     )
 
     def __init__(
@@ -29,6 +29,7 @@ class GridDetection(object):
         bbox=None,
         heading=None,
         center_x=None,
+        source=None,
     ):
         self.found = found
         self.distance_signal = distance_signal
@@ -39,6 +40,7 @@ class GridDetection(object):
         self.bbox = bbox
         self.heading = heading
         self.center_x = center_x
+        self.source = source
 
     def bbox_or_centers(self):
         if self.bbox is not None:
@@ -99,6 +101,27 @@ def reset_grid_tracker() -> None:
         _tracker_cfg_key = None
         _cache_result = None
         _cache_ts = 0.0
+    from tasks.project.packages.leader_blue import reset_leader_blue_cache
+    reset_leader_blue_cache()
+
+
+def fetch_leader_tracking(
+    frame_bgr,
+    cfg: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> GridDetection:
+    """Prefer rear dot grid; fall back to blue duckie body when grid is lost."""
+    grid = fetch_leader_grid(frame_bgr, cfg, force=force)
+    if grid.found:
+        grid.source = "grid"
+        return grid
+    if bool(cfg.get("leader_blue_enabled", True)):
+        from tasks.project.packages.leader_blue import fetch_leader_blue
+        blue = fetch_leader_blue(frame_bgr, cfg, force=force)
+        if blue.found:
+            return blue
+    return grid
 
 
 def detect_leader_grid(frame_bgr, cfg: Dict[str, Any]) -> GridDetection:
@@ -125,6 +148,7 @@ def detect_leader_grid(frame_bgr, cfg: Dict[str, Any]) -> GridDetection:
         bbox=(int(x1), int(y1), int(x2), int(y2)),
         heading=obs.heading,
         center_x=float(cx),
+        source="grid",
     )
 
 
@@ -170,6 +194,8 @@ def draw_grid_overlay(frame_bgr: np.ndarray, detection: GridDetection) -> np.nda
             cy = int(detection.centers[0, 0, 1])
             cv2.circle(out, (cx, cy), 5, (0, 0, 255), -1)
         parts = []
+        if detection.source:
+            parts.append(str(detection.source))
         if detection.distance_signal is not None:
             parts.append(f"dist={detection.distance_signal:.2f}")
         if detection.span_px is not None:
