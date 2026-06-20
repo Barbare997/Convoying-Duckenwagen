@@ -172,27 +172,6 @@ def test_red_at_line_near_band():
     print("OK: intersection triggers only on near red band")
 
 
-def test_intersection_straight_lane_pwm():
-    from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
-    from tasks.project.packages.intersection_follow import intersection_straight_lane_pwm
-
-    agent = LaneServoingAgent()
-    cfg = {
-        "intersection_turn_speed": 0.15,
-        "intersection_straight_min_white_px": 100,
-        "intersection_straight_lane_half_width_px": 160,
-    }
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    assert intersection_straight_lane_pwm(agent, frame, cfg) is None
-
-    frame[200:470, 500:520] = (255, 255, 255)
-    pwm = intersection_straight_lane_pwm(agent, frame, cfg)
-    assert pwm is not None
-    left, right = pwm
-    assert abs(left - right) > 1e-4, "white edge should steer, not blind equal PWM"
-    print("OK: intersection straight follows white boundary")
-
-
 def test_follower_skip_intersection_when_leader_lost():
     from tasks.project.packages.agent import _follower_skip_intersection
 
@@ -583,7 +562,6 @@ if __name__ == "__main__":
     test_follower_grid_signal_mock()
     test_grid_spacing_controller()
     test_red_at_line_near_band()
-    test_intersection_straight_lane_pwm()
     test_project_lane_masks_not_cut_on_straight()
     test_follower_skip_intersection_when_leader_lost()
     test_lane_ignore_red_for_convoy()

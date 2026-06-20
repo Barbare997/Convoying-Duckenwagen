@@ -24,10 +24,6 @@ _EXTRA_CSS = HSV_EXTRA_CSS + '''
 #statusTable .key  { color: var(--text-secondary); font-size: 12px; }
 #statusTable .val  { color: var(--text-primary); font-weight: 500; font-size: 13px; font-family: monospace; }
 .convoy-btn-active { outline: 2px solid var(--accent-green, #2ecc71); outline-offset: 2px; }
-#yoloStatusLine { font-size: 13px; line-height: 1.5; }
-#yoloStatusLine .ok   { color: var(--accent-green, #2ecc71); font-weight: 600; }
-#yoloStatusLine .warn { color: var(--accent-orange, #e67e22); font-weight: 600; }
-#yoloStatusLine .err  { color: #e74c3c; font-weight: 600; }
 '''
 
 _CONTENT = f'''

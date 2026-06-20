@@ -1,4 +1,4 @@
-role: leader
+role: follower
 
 
 
@@ -13,9 +13,6 @@ sign_source: both
 lane_use_direct_pwm: false
 # Straights: 0 = full yellow/white masks (same as visual_lane_servoing).
 # Bottom band is trimmed only when at_line (see lane_ignore_bottom_at_intersection_frac).
-lane_ignore_bottom_frac: 0.0
-lane_ignore_bottom_at_intersection_frac: 0.35
-# 0 = full masks like visual_lane_servoing; bottom band masked only near red line.
 lane_ignore_bottom_frac: 0.0
 lane_ignore_bottom_at_intersection_frac: 0.35
 
@@ -78,17 +75,12 @@ intersection_heading_thresh: 0.12
 # Flip raw grid heading onto turn direction: leader right yaw -> right column taller -> raw h<0 -> turn right.
 intersection_heading_sign: -1.0
 intersection_heading_weak_scale: 0.55
-# Turn/recovery speeds (~slow_speed); outer/inner ratio sets differential arc
-intersection_turn_speed: 0.15
-# Left/right: hold still on the red line this long before differential arc.
-intersection_turn_delay_s: 0.8
-intersection_turn_wait_speed: 0.0
+# Fallback arc speed if cruise target unavailable; TURN uses live spacing/cruise speed.
+intersection_turn_speed: 0.40
+# Optional pause before left/right arc (0 = start arc immediately at cruise speed).
+intersection_turn_delay_s: 0
 intersection_turn_inner_ratio: 0.4
 intersection_turn_outer_ratio: 0.7
-# Straight intersection: follow white lane edge (not blind equal PWM / robot heading).
-intersection_straight_use_lane: true
-intersection_straight_min_white_px: 200
-intersection_straight_lane_half_width_px: 160
 intersection_turn_straight_s: 1.4
 intersection_turn_left_s: 2.1
 intersection_turn_right_s: 2.1
@@ -107,23 +99,9 @@ grid_cols: 7
 
 grid_rows: 3
 
-grid_center_roi: 0.75
-
-grid_min_bbox_area: 400
-
-grid_min_y2_frac: 0.15
-
 grid_blob_min_area: 20
 
 grid_blob_max_area: 12000
-
-grid_min_circularity: 0.5
-
-grid_blur: true
-
-grid_blur_ksize: 5
-
-grid_clustering: true
 
 # MarkerGridTracker (duckietown-convoy style — ROI + far-band + grace)
 grid_downscale: 0.5

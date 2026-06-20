@@ -258,9 +258,13 @@ def intersection_turn_duration(direction, cfg):
     return max(0.2, float(cfg.get(key, 1.5)))
 
 
-def intersection_wheel_commands(direction, cfg):
-    """Fixed differential PWM for intersection arc, scaled to intersection_turn_speed."""
-    turn_speed = min(1.0, max(0.05, float(cfg.get("intersection_turn_speed", 0.15))))
+def intersection_wheel_commands(direction, cfg, speed=None):
+    """Fixed differential PWM for intersection arc at the given cruise speed."""
+    if speed is None:
+        turn_speed = float(cfg.get("intersection_turn_speed", 0.15))
+    else:
+        turn_speed = float(speed)
+    turn_speed = min(1.0, max(0.05, turn_speed))
     inner_ratio = float(cfg.get("intersection_turn_inner_ratio", 0.27))
     outer_ratio = float(cfg.get("intersection_turn_outer_ratio", 1.0))
     inner = min(1.0, turn_speed * inner_ratio)
@@ -270,54 +274,6 @@ def intersection_wheel_commands(direction, cfg):
     if direction == TURN_RIGHT:
         return outer, inner
     return turn_speed, turn_speed
-
-
-def intersection_straight_lane_pwm(lane_agent, frame_bgr, cfg):
-    """Steer along the road using the white edge — parallel inside lane, not robot heading.
-
-    Ignores red/yellow so intersection paint does not pull the robot sideways.
-    Returns (left_pwm, right_pwm) or None to fall back to blind straight PWM.
-    """
-    if frame_bgr is None or lane_agent is None:
-        return None
-    try:
-        import cv2
-        from tasks.visual_lane_servoing.packages.agent import detect_lines_in_slices
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        lane_agent.compute_commands(frame_rgb, ignore_bottom_frac=0.0, debug_red_mask=False)
-        debug = getattr(lane_agent, "last_debug_info", None) or {}
-        mask_w = debug.get("white_mask")
-        if mask_w is None:
-            return None
-        white_px = int(np.count_nonzero(mask_w))
-        min_white = int(cfg.get("intersection_straight_min_white_px", 200))
-        if white_px < min_white:
-            return None
-
-        h, w = mask_w.shape[:2]
-        empty = np.zeros_like(mask_w)
-        _yellow_xs, white_xs = detect_lines_in_slices(empty, mask_w, h)
-        if not white_xs:
-            return None
-
-        half_w = float(
-            cfg.get(
-                "intersection_straight_lane_half_width_px",
-                getattr(lane_agent, "_lane_half_width", 160.0),
-            )
-        )
-        w_pos = lane_agent._weighted_line_x(white_xs)
-        error = (w / 2.0 - (w_pos - half_w)) / max(1.0, w / 2.0)
-        error = float(np.clip(error, -1.0, 1.0))
-        steering = lane_agent._calculate_steering(error)
-
-        speed = min(1.0, max(0.05, float(cfg.get("intersection_turn_speed", 0.15))))
-        left = float(np.clip(speed - steering, 0.0, 1.0))
-        right = float(np.clip(speed + steering, 0.0, 1.0))
-        return left, right
-    except Exception:
-        return None
 
 
 def lane_frame_ok_for_recovery(lane_agent, cfg):

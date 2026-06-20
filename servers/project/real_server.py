@@ -99,12 +99,7 @@ except ModuleNotFoundError:
 
     sample_pixel_from_frame_bgr = None
 
-from tasks.visual_lane_servoing.packages.agent import (
-    LaneServoingAgent,
-    detect_lines_in_slices,
-    _NUM_SLICES,
-    _ROI_START,
-)
+from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.visual_lane_servoing.packages import visual_servoing_activity as _lane_activity
 
 import tasks.project.packages.agent as agent
@@ -757,16 +752,7 @@ def _init_hardware():
         print('\n[4/5] Lane agent...')
 
         if _lane_agent is None:
-
-            _lane_agent = LaneServoingAgent()
-
-            _lane_agent._last_left = 0.0
-
-            _lane_agent._last_right = 0.0
-
-            agent.set_lane_agent(_lane_agent)
-
-        agent.set_driving_enabled(False)
+            raise RuntimeError('Lane agent not initialized')
 
         print(f'  p_gain={_lane_agent.p_gain}, base_speed={_lane_agent.base_speed}')
 

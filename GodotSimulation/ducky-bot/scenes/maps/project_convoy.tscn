@@ -154,7 +154,7 @@ curve = SubResource("Curve3D_kiuloop")
 
 [node name="PathFollower" type="PathFollow3D" parent="NPCPath" unique_id=1750397962]
 script = ExtResource("9_pfwlo")
-speed = 0.12
+speed = 0.4
 
 [node name="DuckieBot_NPC" parent="NPCPath/PathFollower" unique_id=95641082 instance=ExtResource("8_npcbt")]
 

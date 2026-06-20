@@ -11,7 +11,6 @@ import yaml
 from tasks.project.packages.follower_spacing import GridSpacingController
 from tasks.project.packages.intersection_follow import (
     LeaderTurnTracker,
-    intersection_straight_lane_pwm,
     intersection_turn_duration,
     intersection_wheel_commands,
     lane_frame_ok_for_recovery,
@@ -122,15 +121,8 @@ def load_config() -> Dict[str, Any]:
         "leader_loss_confirm_frames": int(cfg.get("leader_loss_confirm_frames", 3)),
         "grid_cols": int(cfg.get("grid_cols", 7)),
         "grid_rows": int(cfg.get("grid_rows", 3)),
-        "grid_center_roi": float(cfg.get("grid_center_roi", 0.75)),
-        "grid_min_bbox_area": int(cfg.get("grid_min_bbox_area", 400)),
-        "grid_min_y2_frac": float(cfg.get("grid_min_y2_frac", 0.15)),
         "grid_blob_min_area": float(cfg.get("grid_blob_min_area", 20)),
         "grid_blob_max_area": float(cfg.get("grid_blob_max_area", 12000)),
-        "grid_min_circularity": float(cfg.get("grid_min_circularity", 0.5)),
-        "grid_blur": bool(cfg.get("grid_blur", True)),
-        "grid_blur_ksize": int(cfg.get("grid_blur_ksize", 5)),
-        "grid_clustering": bool(cfg.get("grid_clustering", True)),
         "grid_downscale": float(cfg.get("grid_downscale", 0.5)),
         "grid_roi_pad_px": int(cfg.get("grid_roi_pad_px", 60)),
         "grid_roi_downscale": float(cfg.get("grid_roi_downscale", 1.0)),
@@ -197,14 +189,8 @@ def load_config() -> Dict[str, Any]:
         "intersection_aspect_baseline_frames": int(cfg.get("intersection_aspect_baseline_frames", 4)),
         "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
         "intersection_turn_delay_s": float(cfg.get("intersection_turn_delay_s", 2.0)),
-        "intersection_turn_wait_speed": float(cfg.get("intersection_turn_wait_speed", 0.0)),
         "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
         "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
-        "intersection_straight_use_lane": bool(cfg.get("intersection_straight_use_lane", True)),
-        "intersection_straight_min_white_px": int(cfg.get("intersection_straight_min_white_px", 200)),
-        "intersection_straight_lane_half_width_px": float(
-            cfg.get("intersection_straight_lane_half_width_px", 160.0)
-        ),
         "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.2)),
         "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 1.8)),
         "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.8)),
@@ -1729,7 +1715,6 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         wheel_pwm = None
         follow_mode = "cruise"
         intersection_pwm = False
-        turn_cap = float(cfg.get("intersection_turn_speed", 0.15))
 
         if intersection_phase == "TURN":
             mode = STATE_INTERSECTION
@@ -1741,34 +1726,13 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 intersection_direction in (TURN_LEFT, TURN_RIGHT)
                 and now < intersection_arc_start
             ):
+                # Pre-arc delay: keep normal cruise lane follow (no stop on red line).
                 wheel_pwm = None
-                wait_speed = max(0.0, float(cfg.get("intersection_turn_wait_speed", 0.0)))
-                too_close_px = float(
-                    cfg.get("intersection_turn_wait_too_close_px", cfg.get("span_too_close_px", 44.0))
-                )
-                if last_span_px is not None and last_span_px >= too_close_px:
-                    target_speed = 0.0
-                else:
-                    target_speed = min(target_speed, wait_speed)
                 follow_mode = f"turn_wait_{intersection_direction}"
-            elif (
-                intersection_direction == TURN_STRAIGHT
-                and bool(cfg.get("intersection_straight_use_lane", True))
-            ):
-                lane_pwm = intersection_straight_lane_pwm(lane_agent, frame_bgr, cfg)
-                wheel_pwm = (
-                    lane_pwm
-                    if lane_pwm is not None
-                    else intersection_wheel_commands(TURN_STRAIGHT, cfg)
-                )
-                target_speed = min(target_speed, turn_cap)
-                intersection_pwm = True
-                follow_mode = "turn_straight_lane"
             else:
                 in_tail = now >= intersection_arc_end
                 drive_dir = TURN_STRAIGHT if in_tail else intersection_direction
-                wheel_pwm = intersection_wheel_commands(drive_dir, cfg)
-                target_speed = min(target_speed, turn_cap)
+                wheel_pwm = intersection_wheel_commands(drive_dir, cfg, speed=target_speed)
                 intersection_pwm = True
                 follow_mode = "turn_tail" if in_tail else f"turn_{intersection_direction}"
             if now >= intersection_end:
