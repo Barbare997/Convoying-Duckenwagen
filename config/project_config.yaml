@@ -72,14 +72,14 @@ intersection_heading_thresh: 0.12
 intersection_heading_sign: -1.0
 # Fixed intersection PWM (straight + arc); not throttled by spacing/blue fallback.
 intersection_turn_speed: 0.40
-intersection_turn_inner_ratio: 0.42
-intersection_turn_outer_ratio: 0.68
-# Left/right: blind straight into the intersection, then timed arc (~90 deg at 2.0s; lower = less yaw).
+intersection_turn_inner_ratio: 0.38
+intersection_turn_outer_ratio: 0.72
+# Left/right: blind straight into the intersection, then timed arc (lower = less yaw).
 intersection_left_preamble_s: 0.55
 intersection_right_preamble_s: 0.35
 intersection_turn_straight_s: 1.4
-intersection_turn_left_s: 1.70
-intersection_turn_right_s: 1.60
+intersection_turn_left_s: 1.90
+intersection_turn_right_s: 1.80
 intersection_turn_tail_straight_s: 0.0
 
 
