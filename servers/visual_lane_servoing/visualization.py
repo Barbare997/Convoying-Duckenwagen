@@ -306,12 +306,19 @@ def create_lane_visualization(
         rm = np.zeros_like(ym)
     red_bgr = np.zeros((*rm.shape, 3), dtype=np.uint8)
     red_bgr[:, :, 2] = rm
-    red_vis = cv2.resize(red_bgr, (display_w * 2, display_h))
+    red_vis = cv2.resize(red_bgr, (display_w, display_h))
+
+    bm = debug_info.get('blue_mask')
+    if bm is None:
+        bm = np.zeros_like(ym)
+    blue_bgr = np.zeros((*bm.shape, 3), dtype=np.uint8)
+    blue_bgr[:, :, 0] = bm
+    blue_vis = cv2.resize(blue_bgr, (display_w, display_h))
 
     grid = np.vstack([
         np.hstack([cam, lane_vis]),
         np.hstack([white_vis, yellow_vis]),
-        red_vis,
+        np.hstack([red_vis, blue_vis]),
     ])
 
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -321,6 +328,7 @@ def create_lane_visualization(
     cv2.putText(grid, "White Lines",  (10,              display_h + 20), font, 0.5, green, 1)
     cv2.putText(grid, "Yellow Lines", (display_w + 10,  display_h + 20), font, 0.5, green, 1)
     cv2.putText(grid, "Red Lines",    (10,              2 * display_h + 20), font, 0.5, green, 1)
+    cv2.putText(grid, "Blue (leader HSV)", (display_w + 10, 2 * display_h + 20), font, 0.5, green, 1)
  
     info = _info_strip(display_w * 2, debug_info, pwm_left, pwm_right)
     return np.vstack([grid, info])

@@ -293,10 +293,10 @@ def test_leader_blue_detection():
     cfg = {
         "role": "follower",
         "leader_blue_enabled": True,
-        "leader_blue_h_min": 95,
-        "leader_blue_h_max": 130,
-        "leader_blue_s_min": 60,
-        "leader_blue_v_min": 35,
+        "leader_blue_h_min": 100,
+        "leader_blue_h_max": 125,
+        "leader_blue_s_min": 90,
+        "leader_blue_v_min": 75,
         "leader_blue_min_area": 400,
     }
     frame = np.zeros((480, 640, 3), dtype=np.uint8)

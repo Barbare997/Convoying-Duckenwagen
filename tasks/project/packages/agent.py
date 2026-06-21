@@ -133,11 +133,11 @@ def load_config() -> Dict[str, Any]:
         "grid_safe_px": float(cfg.get("grid_safe_px", 20.0)),
         "grid_stop_px": float(cfg.get("grid_stop_px", 42.0)),
         "leader_blue_enabled": bool(cfg.get("leader_blue_enabled", True)),
-        "leader_blue_h_min": int(cfg.get("leader_blue_h_min", 95)),
-        "leader_blue_h_max": int(cfg.get("leader_blue_h_max", 130)),
-        "leader_blue_s_min": int(cfg.get("leader_blue_s_min", 60)),
-        "leader_blue_v_min": int(cfg.get("leader_blue_v_min", 35)),
-        "leader_blue_roi_top_frac": float(cfg.get("leader_blue_roi_top_frac", 0.05)),
+        "leader_blue_h_min": int(cfg.get("leader_blue_h_min", 100)),
+        "leader_blue_h_max": int(cfg.get("leader_blue_h_max", 125)),
+        "leader_blue_s_min": int(cfg.get("leader_blue_s_min", 90)),
+        "leader_blue_v_min": int(cfg.get("leader_blue_v_min", 75)),
+        "leader_blue_roi_top_frac": float(cfg.get("leader_blue_roi_top_frac", 0.22)),
         "leader_blue_roi_bottom_frac": float(cfg.get("leader_blue_roi_bottom_frac", 0.82)),
         "leader_blue_min_area": float(cfg.get("leader_blue_min_area", 600.0)),
         "leader_blue_max_area": float(cfg.get("leader_blue_max_area", 90000.0)),
@@ -1237,6 +1237,22 @@ def render_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]):
     if det.source == "blue":
         return draw_blue_overlay(frame_bgr, det)
     return draw_grid_overlay(frame_bgr, det)
+
+
+def enrich_follower_debug_masks(frame_bgr, debug, cfg=None):
+    """Add leader-blue HSV mask to lane debug dict for dashboard tuning."""
+    if frame_bgr is None or not debug:
+        return debug
+    lane_cfg = cfg if cfg is not None else load_config()
+    if str(lane_cfg.get("role", "leader")).lower() != "follower":
+        return debug
+    from tasks.project.packages.leader_blue import leader_blue_debug_mask
+    mask = leader_blue_debug_mask(frame_bgr, lane_cfg)
+    if mask is None:
+        return debug
+    out = dict(debug)
+    out["blue_mask"] = mask
+    return out
 
 
 def set_lane_agent(lane_agent: LaneServoingAgent) -> None:

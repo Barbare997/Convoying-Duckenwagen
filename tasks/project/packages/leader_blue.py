@@ -33,13 +33,13 @@ def _height_to_distance_signal(height_px: float, cfg: Dict[str, Any]) -> float:
 def _leader_blue_mask(frame_bgr: np.ndarray, cfg: Dict[str, Any]) -> np.ndarray:
     h, w = frame_bgr.shape[:2]
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h_min = int(cfg.get("leader_blue_h_min", 95))
-    h_max = int(cfg.get("leader_blue_h_max", 130))
-    s_min = int(cfg.get("leader_blue_s_min", 60))
-    v_min = int(cfg.get("leader_blue_v_min", 35))
+    h_min = int(cfg.get("leader_blue_h_min", 100))
+    h_max = int(cfg.get("leader_blue_h_max", 125))
+    s_min = int(cfg.get("leader_blue_s_min", 90))
+    v_min = int(cfg.get("leader_blue_v_min", 75))
     mask = cv2.inRange(hsv, (h_min, s_min, v_min), (h_max, 255, 255))
 
-    top = int(h * float(cfg.get("leader_blue_roi_top_frac", 0.05)))
+    top = int(h * float(cfg.get("leader_blue_roi_top_frac", 0.22)))
     bot = int(h * float(cfg.get("leader_blue_roi_bottom_frac", 0.82)))
     top = min(max(top, 0), h - 2)
     bot = min(max(bot, top + 1), h)
@@ -53,6 +53,13 @@ def _leader_blue_mask(frame_bgr: np.ndarray, cfg: Dict[str, Any]) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     return mask
+
+
+def leader_blue_debug_mask(frame_bgr, cfg: Dict[str, Any]):
+    """Same HSV mask as detection — for dashboard tuning only."""
+    if frame_bgr is None:
+        return None
+    return _leader_blue_mask(frame_bgr, cfg)
 
 
 def leader_spacing_span_px(det, cfg):

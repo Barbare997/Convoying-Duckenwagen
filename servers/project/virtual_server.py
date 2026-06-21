@@ -108,7 +108,7 @@ def _visualize(frame_bgr):
         return display_bgr
 
     _refresh_display_masks(frame_bgr)
-    debug = _lane_agent.last_debug_info or {}
+    debug = agent.enrich_follower_debug_masks(frame_bgr, _lane_agent.last_debug_info or {})
     pwm_left = float(getattr(_lane_agent, '_last_left', 0.0))
     pwm_right = float(getattr(_lane_agent, '_last_right', 0.0))
     try:

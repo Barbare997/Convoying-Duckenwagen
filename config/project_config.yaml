@@ -110,11 +110,12 @@ grid_stop_px: 48
 
 # Blue duckie body fallback when rear dot grid is too small / lost (real bots).
 leader_blue_enabled: true
-leader_blue_h_min: 95
-leader_blue_h_max: 130
-leader_blue_s_min: 60
-leader_blue_v_min: 35
-leader_blue_roi_top_frac: 0.05
+# Saturated duckie blue only — raise s/v mins to drop dark gray walls at the horizon.
+leader_blue_h_min: 100
+leader_blue_h_max: 125
+leader_blue_s_min: 90
+leader_blue_v_min: 75
+leader_blue_roi_top_frac: 0.22
 leader_blue_roi_bottom_frac: 0.82
 leader_blue_min_area: 600
 leader_blue_max_area: 90000
