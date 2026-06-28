@@ -12,6 +12,7 @@ import socket
 import yaml
 
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
+from servers.visual_lane_servoing.drive_mode import DriveModeController
 from servers.visual_lane_servoing.visualization import create_lane_visualization
 from servers.visual_lane_servoing.color_sample import sample_pixel_from_frame_bgr
 from servers.templates.lane_servoing import LANE_SERVOING_TEMPLATE as HTML_TEMPLATE
@@ -36,6 +37,7 @@ app = Flask(__name__)
 camera  = None
 wheels  = None
 agent   = None
+drive_mode_ctrl = None
 running = False
 stop_event = threading.Event()
 
@@ -47,6 +49,12 @@ def visualize(frame):
         return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     pwm_left, pwm_right = agent.compute_commands(frame)
+    if drive_mode_ctrl is not None:
+        pwm_left, pwm_right = drive_mode_ctrl.apply_pwm(
+            pwm_left, pwm_right, running=running,
+        )
+    elif not running:
+        pwm_left, pwm_right = 0.0, 0.0
     if running:
         wheels.set_wheels_speed(pwm_left, pwm_right)
     else:
@@ -151,6 +159,19 @@ def update_hsv():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/drive_mode', methods=['POST'])
+def set_drive_mode():
+    if drive_mode_ctrl is None:
+        return jsonify({'ok': False, 'error': 'Not initialized'}), 503
+    data = request.json or {}
+    try:
+        mode = drive_mode_ctrl.set(data.get('mode', 'CRUISING'))
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    print(f"[Control] Drive mode -> {mode}", flush=True)
+    return jsonify({'ok': True, 'mode': mode})
+
+
 @app.route('/start', methods=['POST'])
 def start():
     global running
@@ -163,6 +184,8 @@ def start():
 def stop():
     global running, wheels
     running = False
+    if drive_mode_ctrl is not None:
+        drive_mode_ctrl.reset()
     if wheels:
         wheels.set_wheels_speed(0.0, 0.0)
     print("[Control] Stopped")
@@ -181,13 +204,15 @@ def status():
     return jsonify({
         'status': 'active',
         'frame_count': agent.frame_count,
+        'drive_mode': drive_mode_ctrl.get() if drive_mode_ctrl else 'CRUISING',
+        'speed_cap': drive_mode_ctrl.status_dict().get('speed_cap') if drive_mode_ctrl else 0.0,
         'config': {'p_gain': agent.p_gain, 'd_gain': agent.d_gain,
                    'base_speed': agent.base_speed, 'detection_threshold': agent.detection_threshold},
     })
 
 
 def main():
-    global camera, wheels, agent
+    global camera, wheels, agent, drive_mode_ctrl
 
     import argparse
     ap = argparse.ArgumentParser(description="Virtual Lane Servoing Server")
@@ -220,6 +245,22 @@ def main():
     print("\n[3/3] Creating agent...")
     agent = LaneServoingAgent()
     print(f"  p_gain={agent.p_gain}, d_gain={agent.d_gain}, base_speed={agent.base_speed}")
+    try:
+        with open(LANE_CONFIG_FILE, 'r') as f:
+            lane_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        lane_cfg = {}
+    drive_mode_ctrl = DriveModeController(
+        cruise_speed=float(lane_cfg.get("base_speed", agent.base_speed)),
+        slow_speed=float(lane_cfg.get("slow_speed", 0.16)),
+        speed_ramp_s=float(lane_cfg.get("speed_ramp_s", 1.25)),
+        decel_time_s=float(lane_cfg.get("decel_time_s", 1.5)),
+    )
+    print(
+        f"  cruise={drive_mode_ctrl.cruise_speed} slow={drive_mode_ctrl.slow_speed} "
+        f"ramp={drive_mode_ctrl.speed_ramp_s}s decel={drive_mode_ctrl.decel_time_s}s",
+        flush=True,
+    )
 
     web_port = find_available_port(args.port)
     if web_port != args.port:

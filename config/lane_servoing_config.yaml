@@ -3,3 +3,6 @@ curve_speed: 0.21
 d_gain: 1.02
 detection_threshold: 100
 p_gain: 0.38
+slow_speed: 0.16
+speed_ramp_s: 1.25
+decel_time_s: 1.5

@@ -39,8 +39,14 @@ _CONTENT = f'''
                 </div>
                 <div style="display:flex;gap:10px">
                     <button id="btn-start" onclick="driveStart()" class="button success" style="flex:1">Start</button>
-                    <button id="btn-stop"  onclick="driveStop()"  class="button" style="flex:1;background:var(--accent-orange,#e67e22)">Stop</button>
+                    <button id="btn-stop"  onclick="driveStop()"  class="button" style="flex:1;background:var(--accent-orange,#e67e22)">Pause</button>
                 </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+                    <button type="button" id="btn-mode-normal" onclick="setDriveMode('CRUISING')" class="button" style="flex:1;min-width:90px">Normal</button>
+                    <button type="button" id="btn-mode-slow" onclick="setDriveMode('SLOW')" class="button" style="flex:1;min-width:90px;background:#3498db;color:#fff">Slow Down</button>
+                    <button type="button" id="btn-mode-sign-stop" onclick="setDriveMode('STOPPED')" class="button" style="flex:1;min-width:90px;background:#c0392b;color:#fff">Stop Sign</button>
+                </div>
+                <div id="drive-mode-hint" style="font-size:12px;margin-top:10px;color:var(--text-muted)">Mode: CRUISING</div>
             </div>
 
             <!-- Control Parameters card -->
@@ -100,6 +106,47 @@ _JS = HSV_EXTRA_JS + '''
     }
 
     fetch('/running').then(r => r.json()).then(d => setRunningUI(d.running));
+
+    let _driveMode = 'CRUISING';
+
+    function highlightDriveMode(mode) {
+        const ids = {
+            CRUISING: 'btn-mode-normal',
+            SLOW: 'btn-mode-slow',
+            STOPPED: 'btn-mode-sign-stop',
+        };
+        Object.keys(ids).forEach(m => {
+            const el = document.getElementById(ids[m]);
+            if (el) el.style.outline = (m === mode) ? '2px solid #2ecc71' : '';
+        });
+        const hint = document.getElementById('drive-mode-hint');
+        if (hint) hint.textContent = 'Mode: ' + mode;
+    }
+
+    function setDriveMode(mode) {
+        postJSON('/drive_mode', { mode: mode })
+            .then(d => {
+                _driveMode = d.mode || mode;
+                highlightDriveMode(_driveMode);
+            })
+            .catch(() => showStatus('config-status', 'Mode change failed!', 'error'));
+    }
+
+    function refreshDriveMode() {
+        fetch('/status').then(r => r.json()).then(d => {
+            if (d.drive_mode) {
+                _driveMode = d.drive_mode;
+                highlightDriveMode(_driveMode);
+                const hint = document.getElementById('drive-mode-hint');
+                if (hint) {
+                    const cap = (d.speed_cap != null) ? ` (${Number(d.speed_cap).toFixed(2)} PWM)` : '';
+                    hint.textContent = 'Mode: ' + _driveMode + cap;
+                }
+            }
+        }).catch(() => {});
+    }
+    setInterval(refreshDriveMode, 1000);
+    refreshDriveMode();
 
     document.getElementById('k_d').oninput = function() {
         document.getElementById('k_d_value').textContent = this.value;
