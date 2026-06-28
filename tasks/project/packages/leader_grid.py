@@ -95,14 +95,22 @@ def _get_tracker(cfg: Dict[str, Any]) -> MarkerGridTracker:
 
 def reset_grid_tracker() -> None:
     """Clear tracker state after sim reset."""
-    global _tracker, _tracker_cfg_key, _cache_result, _cache_ts
+    global _tracker, _tracker_cfg_key, _cache_result, _cache_ts, _tracking_cache
     with _cache_lock:
         _tracker = None
         _tracker_cfg_key = None
         _cache_result = None
         _cache_ts = 0.0
-    from tasks.project.packages.leader_blue import reset_leader_blue_cache
-    reset_leader_blue_cache()
+        _tracking_cache = None
+    from tasks.project.packages.leader_detector import reset_leader_detector_cache
+    reset_leader_detector_cache()
+
+
+_tracking_cache = None  # type: Optional[GridDetection]
+
+
+def get_cached_leader_tracking() -> Optional[GridDetection]:
+    return _tracking_cache
 
 
 def fetch_leader_tracking(
@@ -111,17 +119,27 @@ def fetch_leader_tracking(
     *,
     force: bool = False,
 ) -> GridDetection:
-    """Prefer rear dot grid; fall back to blue duckie body when grid is lost."""
-    grid = fetch_leader_grid(frame_bgr, cfg, force=force)
-    if grid.found:
-        grid.source = "grid"
-        return grid
-    if bool(cfg.get("leader_blue_enabled", True)):
-        from tasks.project.packages.leader_blue import fetch_leader_blue
-        blue = fetch_leader_blue(frame_bgr, cfg, force=force)
-        if blue.found:
-            return blue
-    return grid
+    """Primary: YOLO truck detector. Fallback: rear dot grid."""
+    global _tracking_cache
+    pattern = _pattern_size(cfg)
+
+    if bool(cfg.get("leader_detector_enabled", True)):
+        from tasks.project.packages.leader_detector import fetch_leader_detector
+        det = fetch_leader_detector(frame_bgr, cfg, force=force)
+        if det.found:
+            _tracking_cache = det
+            return det
+
+    if bool(cfg.get("leader_grid_fallback_enabled", True)):
+        grid = fetch_leader_grid(frame_bgr, cfg, force=force)
+        if grid.found:
+            grid.source = "grid"
+            _tracking_cache = grid
+            return grid
+
+    empty = GridDetection(False, None, 0.0, None, pattern, source="detector")
+    _tracking_cache = empty
+    return empty
 
 
 def detect_leader_grid(frame_bgr, cfg: Dict[str, Any]) -> GridDetection:

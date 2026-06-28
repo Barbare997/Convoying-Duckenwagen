@@ -11,6 +11,7 @@ import yaml
 from tasks.project.packages.follower_spacing import GridSpacingController
 from tasks.project.packages.intersection_follow import (
     LeaderTurnTracker,
+    intersection_phase_deadlines,
     intersection_turn_schedule,
     intersection_wheel_commands,
     measure_red_at_line,
@@ -24,13 +25,40 @@ from tasks.project.packages.leader_grid import (
     fetch_leader_grid,
     fetch_leader_tracking,
     get_cached_grid_detection,
+    get_cached_leader_tracking,
 )
-from tasks.project.packages.leader_blue import draw_blue_overlay, leader_spacing_span_px
+from tasks.project.packages.leader_detector import (
+    fetch_leader_detector,
+    get_cached_leader_detector,
+    get_detector_status,
+    leader_detector_ready,
+    leader_spacing_span_px,
+    leader_spacing_target_px,
+    leader_spacing_too_close_for_source,
+    leader_spacing_too_close_px,
+    render_leader_camera_overlay,
+    set_detector_agent,
+)
 from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
- 
-_CONFIG_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "project_config.yaml")
-)
+
+
+def _resolve_project_config_path() -> str:
+    """Canonical project_config.yaml (repo root, or KVATITOWN_ROOT on deployed bot)."""
+    env_root = os.environ.get("KVATITOWN_ROOT", "").strip()
+    if env_root:
+        return os.path.normpath(os.path.join(env_root, "config", "project_config.yaml"))
+    try:
+        from launcher.config import CONFIG_DIR
+        return str(CONFIG_DIR / "project_config.yaml")
+    except Exception:
+        return os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__), "..", "..", "..", "config", "project_config.yaml",
+            ),
+        )
+
+
+_CONFIG_PATH = _resolve_project_config_path()
  
 # States
 STATE_CRUISING = "CRUISING"
@@ -61,12 +89,11 @@ _sign_runtime = {
     "candidate_event": EVENT_NORMAL,
     "candidate_count": 0,
     "active_until": 0.0,
-    # Stop-on-loss: arm after seeing stop tag, trigger when it leaves the frame.
-    "stop_visible_streak": 0,
-    "stop_armed": False,
-    "stop_loss_streak": 0,
+    # Stop sign: distance-based trigger + rearm after hold.
+    "stop_confirm_count": 0,
+    "stop_triggered_latch": False,
+    "stop_pending_rearm": False,
     "stop_rearm_until": 0.0,
-    "stop_tag_latch_resume": False,
     # Slow sign: distance-based engage + loss confirm to resume.
     "slow_confirm_count": 0,
     "slow_engaged": False,
@@ -86,25 +113,158 @@ _manual_convoy_cmd = MANUAL_CRUISING
 _manual_lock = threading.Lock()
 _manual_slow_until = 0.0
 
+_test_turn_lock = threading.Lock()
+_pending_test_turn: Optional[str] = None
+_follower_test_turn_active = False
+
+_config_io_lock = threading.Lock()
+_last_good_raw: Dict[str, Any] = {}
+_runtime_intersection_turn: Dict[str, float] = {}
+_runtime_intersection_lock = threading.Lock()
+
+_INTERSECTION_TURN_KEYS = (
+    "intersection_left_preamble_s",
+    "intersection_right_preamble_s",
+    "intersection_turn_straight_s",
+    "intersection_turn_left_s",
+    "intersection_turn_right_s",
+    "intersection_turn_tail_straight_s",
+    "intersection_turn_speed",
+    "intersection_turn_inner_ratio",
+    "intersection_turn_outer_ratio",
+)
+
+
+def _read_project_config_raw() -> Dict[str, Any]:
+    """Read project_config.yaml; keep last good copy if the file is briefly unreadable."""
+    global _last_good_raw
+    with _config_io_lock:
+        try:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            if isinstance(raw, dict) and raw:
+                _last_good_raw = dict(raw)
+            return dict(_last_good_raw)
+        except Exception:
+            return dict(_last_good_raw)
+
+
+def get_project_config_path() -> str:
+    return _CONFIG_PATH
+
+
+def _merge_project_config_raw(updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomically read-merge-write project_config.yaml (prevents slider races)."""
+    global _last_good_raw
+    if not updates:
+        return dict(_last_good_raw)
+    with _config_io_lock:
+        raw: Dict[str, Any] = {}
+        try:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            if isinstance(loaded, dict):
+                raw = dict(loaded)
+        except Exception as exc:
+            if _last_good_raw:
+                raw = dict(_last_good_raw)
+            else:
+                raise OSError(
+                    f"Cannot read project config at {_CONFIG_PATH}: {exc}",
+                ) from exc
+        for key, val in updates.items():
+            raw[key] = val
+        tmp_path = f"{_CONFIG_PATH}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(raw, f, default_flow_style=False)
+            os.replace(tmp_path, _CONFIG_PATH)
+        except Exception as exc:
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            raise OSError(
+                f"Cannot write project config at {_CONFIG_PATH}: {exc}",
+            ) from exc
+        _last_good_raw = dict(raw)
+        _invalidate_config_cache()
+        return dict(raw)
+
+
+try:
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as _bootstrap_f:
+        _bootstrap_raw = yaml.safe_load(_bootstrap_f) or {}
+    if isinstance(_bootstrap_raw, dict) and _bootstrap_raw:
+        _last_good_raw = dict(_bootstrap_raw)
+except Exception:
+    pass
+
+
+def _write_project_config_raw(raw: Dict[str, Any]) -> None:
+    """Legacy full-file write — prefer _merge_project_config_raw for UI patches."""
+    _merge_project_config_raw(dict(raw))
+
+
+def _intersection_turn_from_cfg(cfg: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "intersection_left_preamble_s": float(cfg.get("intersection_left_preamble_s", 0.69)),
+        "intersection_right_preamble_s": float(cfg.get("intersection_right_preamble_s", 0.44)),
+        "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.75)),
+        "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 2.38)),
+        "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.06)),
+        "intersection_turn_tail_straight_s": float(cfg.get("intersection_turn_tail_straight_s", 0.0)),
+        "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.32)),
+        "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.38)),
+        "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 0.72)),
+    }
+
+
+def _publish_runtime_intersection_turn(params: Dict[str, float]) -> None:
+    with _runtime_intersection_lock:
+        _runtime_intersection_turn.clear()
+        _runtime_intersection_turn.update(params)
+
+
+_config_cache_base: Optional[Dict[str, Any]] = None
+_config_cache_mtime: float = -1.0
+
+
+def _invalidate_config_cache() -> None:
+    global _config_cache_mtime
+    _config_cache_mtime = -1.0
+
 
 def load_config() -> Dict[str, Any]:
     # Load only the fields needed by the skeleton. Missing file -> safe defaults.
+    global _config_cache_base, _config_cache_mtime
     try:
-        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception:
-        cfg = {}
- 
+        mtime = os.path.getmtime(_CONFIG_PATH)
+    except OSError:
+        mtime = 0.0
+    if _config_cache_base is None or mtime != _config_cache_mtime:
+        cfg = _read_project_config_raw()
+        _config_cache_base = _build_config_dict(cfg)
+        _config_cache_mtime = mtime
+    out = dict(_config_cache_base)
+    with _runtime_intersection_lock:
+        if _runtime_intersection_turn:
+            out.update(_runtime_intersection_turn)
+    return out
+
+
+def _build_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "role": str(cfg.get("role", "leader")).strip().lower(),
-        "cruise_speed": float(cfg.get("cruise_speed", 0.4)),
-        "slow_speed": float(cfg.get("slow_speed", 0.15)),
-        "follower_max_speed": float(cfg.get("follower_max_speed", 0.4)),
+        "cruise_speed": float(cfg.get("cruise_speed", 0.32)),
+        "slow_speed": float(cfg.get("slow_speed", 0.16)),
+        "follower_max_speed": float(cfg.get("follower_max_speed", 0.368)),
         "follower_min_speed": float(cfg.get("follower_min_speed", 0.0)),
         "follower_require_leader": bool(cfg.get("follower_require_leader", True)),
         "follower_spacing_warmup_frames": int(cfg.get("follower_spacing_warmup_frames", 8)),
         "follower_catchup_margin": float(cfg.get("follower_catchup_margin", 0.06)),
-        "follower_lane_fallback_speed": float(cfg.get("follower_lane_fallback_speed", 0.15)),
+        "follower_lane_fallback_speed": float(cfg.get("follower_lane_fallback_speed", 0.32)),
         "span_target_px": float(cfg.get("span_target_px", 32.0)),
         "spacing_kp": float(cfg.get("spacing_kp", 0.010)),
         "spacing_kd": float(cfg.get("spacing_kd", 0.018)),
@@ -114,7 +274,7 @@ def load_config() -> Dict[str, Any]:
         "spacing_steady_span_px": float(cfg.get("spacing_steady_span_px", 5.0)),
         "spacing_steady_span_dot": float(cfg.get("spacing_steady_span_dot", 10.0)),
         "span_too_close_px": float(cfg.get("span_too_close_px", 44.0)),
-        "span_too_close_speed": float(cfg.get("span_too_close_speed", 0.06)),
+        "span_too_close_speed": float(cfg.get("span_too_close_speed", 0.05)),
         "grid_detect_hz": float(cfg.get("grid_detect_hz", 10)),
         "leader_loss_confirm_frames": int(cfg.get("leader_loss_confirm_frames", 3)),
         "grid_cols": int(cfg.get("grid_cols", 7)),
@@ -132,37 +292,32 @@ def load_config() -> Dict[str, Any]:
         "grid_blob_min_circularity": float(cfg.get("grid_blob_min_circularity", 0.6)),
         "grid_safe_px": float(cfg.get("grid_safe_px", 20.0)),
         "grid_stop_px": float(cfg.get("grid_stop_px", 42.0)),
-        "leader_blue_enabled": bool(cfg.get("leader_blue_enabled", True)),
-        "leader_blue_h_min": int(cfg.get("leader_blue_h_min", 100)),
-        "leader_blue_h_max": int(cfg.get("leader_blue_h_max", 125)),
-        "leader_blue_s_min": int(cfg.get("leader_blue_s_min", 90)),
-        "leader_blue_v_min": int(cfg.get("leader_blue_v_min", 75)),
-        "leader_blue_roi_top_frac": float(cfg.get("leader_blue_roi_top_frac", 0.22)),
-        "leader_blue_roi_bottom_frac": float(cfg.get("leader_blue_roi_bottom_frac", 0.82)),
-        "leader_blue_min_area": float(cfg.get("leader_blue_min_area", 600.0)),
-        "leader_blue_max_area": float(cfg.get("leader_blue_max_area", 90000.0)),
-        "leader_blue_morph_kernel": int(cfg.get("leader_blue_morph_kernel", 5)),
-        "leader_blue_span_scale": float(cfg.get("leader_blue_span_scale", 0.55)),
-        "leader_blue_span_target_px": float(cfg.get("leader_blue_span_target_px", 36.0)),
-        "leader_blue_safe_px": float(cfg.get("leader_blue_safe_px", 14.0)),
-        "leader_blue_stop_px": float(cfg.get("leader_blue_stop_px", 50.0)),
+        "leader_detector_enabled": bool(cfg.get("leader_detector_enabled", True)),
+        "leader_detector_class": int(cfg.get("leader_detector_class", 1)),
+        "leader_detector_hz": float(cfg.get("leader_detector_hz", 8.0)),
+        "leader_detector_min_area": float(cfg.get("leader_detector_min_area", 500.0)),
+        "leader_detector_roi_top_frac": float(cfg.get("leader_detector_roi_top_frac", 0.0)),
+        "leader_detector_roi_bottom_frac": float(cfg.get("leader_detector_roi_bottom_frac", 0.82)),
+        "leader_detector_span_scale": float(cfg.get("leader_detector_span_scale", 0.55)),
+        "leader_detector_span_target_px": float(cfg.get("leader_detector_span_target_px", 36.0)),
+        "leader_detector_safe_px": float(cfg.get("leader_detector_safe_px", 14.0)),
+        "leader_detector_stop_px": float(cfg.get("leader_detector_stop_px", 50.0)),
+        "leader_grid_fallback_enabled": bool(cfg.get("leader_grid_fallback_enabled", True)),
         "intersection_blue_straight_center_px": float(
             cfg.get("intersection_blue_straight_center_px", 18.0)
         ),
         "stop_hold_s": float(cfg.get("stop_hold_s", 2.0)),
         "slow_hold_s": float(cfg.get("slow_hold_s", 4.0)),
-        "decel_time_s": float(cfg.get("decel_time_s", 1.2)),
+        "decel_time_s": float(cfg.get("decel_time_s", 1.5)),
         "decel_steps": int(cfg.get("decel_steps", 10)),
-        "speed_ramp_s": float(cfg.get("speed_ramp_s", 1.0)),
+        "speed_ramp_s": float(cfg.get("speed_ramp_s", 1.25)),
         "stop_tag_ids": [int(x) for x in cfg.get("stop_tag_ids", [])],
         "slow_tag_ids": [int(x) for x in cfg.get("slow_tag_ids", [])],
         "sign_confirm_frames": int(cfg.get("sign_confirm_frames", 3)),
         "sign_cooldown_s": float(cfg.get("sign_cooldown_s", 2.0)),
         "sign_center_roi": float(cfg.get("sign_center_roi", 1.0)),
-        # Stop sign: trigger when tag leaves FOV after being seen (not on first sight).
-        "sign_stop_on_loss": bool(cfg.get("sign_stop_on_loss", True)),
-        "sign_stop_seen_min_frames": int(cfg.get("sign_stop_seen_min_frames", 8)),
-        "sign_stop_loss_confirm_frames": int(cfg.get("sign_stop_loss_confirm_frames", 2)),
+        # Stop sign: trigger when tag is within sign_stop_distance_m (pose / tag width).
+        "sign_stop_distance_m": float(cfg.get("sign_stop_distance_m", 0.25)),
         "sign_stop_rearm_s": float(cfg.get("sign_stop_rearm_s", 6.0)),
         # Slow sign: distance (pose_t from dt_apriltags) or legacy delay mode.
         "sign_slow_mode": str(cfg.get("sign_slow_mode", "distance")).strip().lower(),
@@ -200,14 +355,14 @@ def load_config() -> Dict[str, Any]:
         "intersection_heading_sign": float(cfg.get("intersection_heading_sign", -1.0)),
         "intersection_straight_aspect_min": float(cfg.get("intersection_straight_aspect_min", 2.2)),
         "intersection_last_cx_offset_px": float(cfg.get("intersection_last_cx_offset_px", 28.0)),
-        "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.15)),
+        "intersection_turn_speed": float(cfg.get("intersection_turn_speed", 0.32)),
         "intersection_turn_inner_ratio": float(cfg.get("intersection_turn_inner_ratio", 0.27)),
         "intersection_turn_outer_ratio": float(cfg.get("intersection_turn_outer_ratio", 1.0)),
-        "intersection_left_preamble_s": float(cfg.get("intersection_left_preamble_s", 0.55)),
-        "intersection_right_preamble_s": float(cfg.get("intersection_right_preamble_s", 0.35)),
-        "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.2)),
-        "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 1.8)),
-        "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.8)),
+        "intersection_left_preamble_s": float(cfg.get("intersection_left_preamble_s", 0.69)),
+        "intersection_right_preamble_s": float(cfg.get("intersection_right_preamble_s", 0.44)),
+        "intersection_turn_straight_s": float(cfg.get("intersection_turn_straight_s", 1.75)),
+        "intersection_turn_left_s": float(cfg.get("intersection_turn_left_s", 2.38)),
+        "intersection_turn_right_s": float(cfg.get("intersection_turn_right_s", 1.06)),
         "intersection_turn_tail_straight_s": float(cfg.get("intersection_turn_tail_straight_s", 1.6)),
     }
 
@@ -251,6 +406,57 @@ def set_manual_convoy_command(command: str) -> Dict[str, Any]:
     if prev != cmd:
         print(f"[Project][Leader] Manual convoy command: {prev} -> {cmd}", flush=True)
     return {"ok": True, "command": cmd, "previous": prev}
+
+
+def _normalize_test_turn_direction(direction: str) -> str:
+    d = str(direction or "").strip().lower()
+    if d in ("straight", "forward", "fwd", "go"):
+        return TURN_STRAIGHT
+    if d == TURN_LEFT:
+        return TURN_LEFT
+    if d == TURN_RIGHT:
+        return TURN_RIGHT
+    raise ValueError("direction must be left, right, or straight")
+
+
+def request_follower_test_turn(direction: str) -> Dict[str, Any]:
+    """Queue a timed intersection maneuver (works while paused — no Start required)."""
+    global _pending_test_turn
+    cfg = load_config()
+    if str(cfg.get("role", "leader")).lower() != "follower":
+        return {"status": "error", "message": "follower role required"}
+    turn_dir = _normalize_test_turn_direction(direction)
+    with _test_turn_lock:
+        _pending_test_turn = turn_dir
+    return {"status": "ok", "direction": turn_dir, "queued": True}
+
+
+def get_follower_test_turn_status() -> Dict[str, Any]:
+    with _test_turn_lock:
+        return {
+            "queued": _pending_test_turn,
+            "active": _follower_test_turn_active,
+        }
+
+
+def _pop_follower_test_turn() -> Optional[str]:
+    global _pending_test_turn
+    with _test_turn_lock:
+        turn_dir = _pending_test_turn
+        _pending_test_turn = None
+        return turn_dir
+
+
+def _set_follower_test_turn_active(active: bool) -> None:
+    global _follower_test_turn_active
+    with _test_turn_lock:
+        _follower_test_turn_active = bool(active)
+
+
+def _follower_wheels_allowed() -> bool:
+    with _test_turn_lock:
+        test_active = _follower_test_turn_active
+    return is_driving_enabled() or test_active
 
 
 def _maybe_auto_clear_manual_slow(now: float) -> None:
@@ -312,15 +518,17 @@ def _resolve_leader_event(
 def get_grid_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cols = int(cfg.get("grid_cols", 7))
     rows = int(cfg.get("grid_rows", 3))
-    cached = get_cached_grid_detection()
+    cached = get_cached_leader_tracking() or get_cached_grid_detection()
     out = {
         "ready": True,
-        "method": "marker_grid",
+        "method": getattr(cached, "source", None) or "none",
         "pattern": f"{cols}x{rows}",
         "last_found": bool(cached.found) if cached is not None else False,
     }
     if cached is not None and cached.span_px is not None:
         out["span_px"] = round(float(cached.span_px), 1)
+    if cached is not None and getattr(cached, "quality", None) is not None:
+        out["score"] = round(float(cached.quality), 3)
     return out
 
 
@@ -333,6 +541,8 @@ def get_runtime_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
     if role == "follower":
         out["grid"] = get_grid_status(cfg)
+        out["detector"] = get_detector_status(cfg)
+        out["test_turn"] = get_follower_test_turn_status()
     elif role == "leader":
         out["apriltag_available"] = apriltag_detector_ready()
     return out
@@ -463,9 +673,9 @@ def _ramp_toward(current: float, target: float, max_delta: float) -> float:
 
 
 def _speed_ramp_delta(cfg: Dict[str, Any], frame_dt: float) -> float:
-    cruise = float(cfg.get("cruise_speed", 0.4))
-    slow = float(cfg.get("slow_speed", 0.15))
-    ramp_s = max(0.05, float(cfg.get("speed_ramp_s", 1.0)))
+    cruise = float(cfg.get("cruise_speed", 0.32))
+    slow = float(cfg.get("slow_speed", 0.16))
+    ramp_s = max(0.05, float(cfg.get("speed_ramp_s", 1.25)))
     span = max(0.05, abs(cruise - slow))
     return span / ramp_s * max(1e-3, float(frame_dt))
 
@@ -888,52 +1098,13 @@ def _detect_apriltags(frame_gray, cfg: Optional[Dict[str, Any]] = None) -> List[
         return []
 
 
-def _sign_visibility_from_detections(
+def _sign_tag_distance_from_detections(
     detections: List[Any],
-    stop_ids: Set[int],
-    slow_ids: Set[int],
-    frame_shape: Optional[Tuple[int, int]],
-    center_roi: float,
-) -> Tuple[bool, bool]:
-    """Return (stop_tag_visible, slow_tag_visible) in the sign ROI."""
-    if not detections:
-        return False, False
-
-    cx_min, cx_max = -1.0, 2.0
-    if frame_shape is not None:
-        _h, w = frame_shape
-        roi = max(0.2, min(1.0, float(center_roi)))
-        margin = (1.0 - roi) * 0.5
-        cx_min = margin * w
-        cx_max = (1.0 - margin) * w
-
-    seen_stop = False
-    seen_slow = False
-    for det in detections:
-        try:
-            tag_id = int(det.tag_id)
-            c = det.center
-            cx = float(c[0]) if c is not None else None
-        except Exception:
-            continue
-
-        if cx is not None and not (cx_min <= cx <= cx_max):
-            continue
-        if tag_id in stop_ids:
-            seen_stop = True
-        elif tag_id in slow_ids:
-            seen_slow = True
-
-    return seen_stop, seen_slow
-
-
-def _sign_slow_from_detections(
-    detections: List[Any],
-    slow_ids: Set[int],
+    tag_ids: Set[int],
     frame_shape: Optional[Tuple[int, int]],
     center_roi: float,
 ) -> Tuple[bool, Optional[float]]:
-    """Return (slow_tag_visible_in_roi, nearest_distance_m)."""
+    """Return (tag_visible_in_roi, nearest_distance_m)."""
     if not detections:
         return False, None
 
@@ -954,7 +1125,7 @@ def _sign_slow_from_detections(
         except Exception:
             continue
 
-        if tag_id not in slow_ids:
+        if tag_id not in tag_ids:
             continue
         if cx is not None and not (cx_min <= cx <= cx_max):
             continue
@@ -972,36 +1143,62 @@ def _sign_slow_from_detections(
     return True, nearest
 
 
-def _reset_stop_loss_tracker() -> None:
-    _sign_runtime["stop_visible_streak"] = 0
-    _sign_runtime["stop_armed"] = False
-    _sign_runtime["stop_loss_streak"] = 0
+def _sign_slow_from_detections(
+    detections: List[Any],
+    slow_ids: Set[int],
+    frame_shape: Optional[Tuple[int, int]],
+    center_roi: float,
+) -> Tuple[bool, Optional[float]]:
+    return _sign_tag_distance_from_detections(detections, slow_ids, frame_shape, center_roi)
 
 
-def _stop_event_on_loss(seen_stop: bool, cfg: Dict[str, Any]) -> str:
-    """Arm while stop tag is visible; trigger STOP when it disappears from view."""
-    seen_min = max(1, int(cfg.get("sign_stop_seen_min_frames", 8)))
-    loss_confirm = max(1, int(cfg.get("sign_stop_loss_confirm_frames", 2)))
+def _sign_stop_from_detections(
+    detections: List[Any],
+    stop_ids: Set[int],
+    frame_shape: Optional[Tuple[int, int]],
+    center_roi: float,
+) -> Tuple[bool, Optional[float]]:
+    return _sign_tag_distance_from_detections(detections, stop_ids, frame_shape, center_roi)
 
-    if seen_stop:
-        _sign_runtime["stop_visible_streak"] = int(_sign_runtime.get("stop_visible_streak", 0)) + 1
-        _sign_runtime["stop_loss_streak"] = 0
-        if int(_sign_runtime["stop_visible_streak"]) >= seen_min:
-            _sign_runtime["stop_armed"] = True
+
+def _reset_stop_tracker() -> None:
+    _sign_runtime["stop_confirm_count"] = 0
+    _sign_runtime["stop_triggered_latch"] = False
+    _sign_runtime["stop_pending_rearm"] = False
+
+
+def _stop_event_distance(
+    seen_stop: bool,
+    stop_distance_m: Optional[float],
+    cfg: Dict[str, Any],
+) -> str:
+    """Trigger STOP when stop tag is within sign_stop_distance_m."""
+    if bool(_sign_runtime.get("stop_triggered_latch", False)):
         return EVENT_NORMAL
 
-    if not bool(_sign_runtime.get("stop_armed", False)):
-        _sign_runtime["stop_visible_streak"] = 0
+    confirm_frames = max(1, int(cfg.get("sign_confirm_frames", 3)))
+    threshold_m = max(0.05, float(cfg.get("sign_stop_distance_m", 0.25)))
+
+    if not seen_stop or stop_distance_m is None:
+        _sign_runtime["stop_confirm_count"] = 0
         return EVENT_NORMAL
 
-    _sign_runtime["stop_loss_streak"] = int(_sign_runtime.get("stop_loss_streak", 0)) + 1
-    _sign_runtime["stop_visible_streak"] = 0
-    if int(_sign_runtime["stop_loss_streak"]) < loss_confirm:
+    if float(stop_distance_m) > threshold_m:
+        _sign_runtime["stop_confirm_count"] = 0
         return EVENT_NORMAL
 
-    _reset_stop_loss_tracker()
-    _sign_runtime["stop_tag_latch_resume"] = True
-    print("[Project][Leader] Stop sign lost from view — triggering STOP", flush=True)
+    _sign_runtime["stop_confirm_count"] = int(_sign_runtime.get("stop_confirm_count", 0)) + 1
+    if int(_sign_runtime["stop_confirm_count"]) < confirm_frames:
+        return EVENT_NORMAL
+
+    _sign_runtime["stop_confirm_count"] = 0
+    _sign_runtime["stop_triggered_latch"] = True
+    _sign_runtime["stop_pending_rearm"] = True
+    print(
+        f"[Project][Leader] Stop sign within {threshold_m:.2f}m "
+        f"(d={float(stop_distance_m):.2f}m) — triggering STOP",
+        flush=True,
+    )
     return EVENT_STOP_SIGN
 
 
@@ -1023,8 +1220,7 @@ def reset_sign_detection_state() -> None:
     _sign_runtime["candidate_count"] = 0
     _sign_runtime["active_until"] = 0.0
     _sign_runtime["stop_rearm_until"] = 0.0
-    _sign_runtime["stop_tag_latch_resume"] = False
-    _reset_stop_loss_tracker()
+    _reset_stop_tracker()
     _reset_slow_tracker()
 
 
@@ -1140,30 +1336,6 @@ def _slow_event_from_detections(
     return _slow_event_distance(seen_slow, slow_distance_m, cfg, now, cooldown_s)
 
 
-def _confirm_level_sign_event(
-    raw_event: str,
-    confirm_frames: int,
-    cooldown_s: float,
-    now: float,
-) -> str:
-    """Level-trigger confirm (used for slow signs and legacy stop-on-sight)."""
-    if raw_event == EVENT_NORMAL:
-        _sign_runtime["candidate_event"] = EVENT_NORMAL
-        _sign_runtime["candidate_count"] = 0
-        return EVENT_NORMAL
-
-    if _sign_runtime["candidate_event"] == raw_event:
-        _sign_runtime["candidate_count"] = int(_sign_runtime["candidate_count"]) + 1
-    else:
-        _sign_runtime["candidate_event"] = raw_event
-        _sign_runtime["candidate_count"] = 1
-
-    if int(_sign_runtime["candidate_count"]) >= confirm_frames:
-        _sign_runtime["active_until"] = now + cooldown_s
-        return raw_event
-    return EVENT_NORMAL
-
-
 def detect_sign_event(
     detections: List[Any],
     frame_shape: Optional[Tuple[int, int]],
@@ -1171,47 +1343,32 @@ def detect_sign_event(
 ) -> str:
     stop_ids = set(int(x) for x in cfg.get("stop_tag_ids", []))
     slow_ids = set(int(x) for x in cfg.get("slow_tag_ids", []))
-    confirm_frames = max(1, int(cfg.get("sign_confirm_frames", 3)))
     cooldown_s = max(0.0, float(cfg.get("sign_cooldown_s", 2.0)))
     center_roi = float(cfg.get("sign_center_roi", 1.0))
-    stop_on_loss = bool(cfg.get("sign_stop_on_loss", True))
-
     now = time.time()
     if now < float(_sign_runtime["active_until"]):
         cached = str(_sign_runtime["candidate_event"])
         if cached != EVENT_SLOW_SIGN or not bool(_sign_runtime.get("slow_engaged")):
             return cached
 
-    seen_stop, seen_slow = _sign_visibility_from_detections(
+    _seen_stop, stop_distance_m = _sign_stop_from_detections(
         detections=detections,
         stop_ids=stop_ids,
-        slow_ids=slow_ids,
         frame_shape=frame_shape,
         center_roi=center_roi,
     )
-    _seen_slow, slow_distance_m = _sign_slow_from_detections(
+    seen_slow, slow_distance_m = _sign_slow_from_detections(
         detections=detections,
         slow_ids=slow_ids,
         frame_shape=frame_shape,
         center_roi=center_roi,
     )
-    if _seen_slow:
-        seen_slow = True
 
     if now < float(_sign_runtime.get("stop_rearm_until", 0.0)):
-        _reset_stop_loss_tracker()
+        _reset_stop_tracker()
         stop_event = EVENT_NORMAL
-    elif stop_on_loss:
-        stop_event = _stop_event_on_loss(seen_stop, cfg)
     else:
-        stop_event = _confirm_level_sign_event(
-            EVENT_STOP_SIGN if seen_stop else EVENT_NORMAL,
-            confirm_frames,
-            cooldown_s,
-            now,
-        )
-        if stop_event == EVENT_STOP_SIGN:
-            return stop_event
+        stop_event = _stop_event_distance(_seen_stop, stop_distance_m, cfg)
 
     if stop_event == EVENT_STOP_SIGN:
         _reset_slow_tracker()
@@ -1224,35 +1381,136 @@ def detect_sign_event(
 
 
 def get_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]) -> Optional[GridDetection]:
-    """Shared leader tracking detect + cache for MJPEG preview."""
+    """Shared leader tracking cache for MJPEG preview (avoid duplicate inference)."""
+    cached = get_cached_leader_tracking()
+    if cached is not None:
+        return cached
     if frame_bgr is None:
         return get_cached_grid_detection()
     return fetch_leader_tracking(frame_bgr, cfg)
 
 
 def render_follower_grid_overlay(frame_bgr, cfg: Dict[str, Any]):
-    det = get_follower_grid_overlay(frame_bgr, cfg)
-    if det is None or not det.found:
+    """YOLO boxes on main camera; grid overlay only when detector lost the leader."""
+    if frame_bgr is None:
         return frame_bgr
-    if det.source == "blue":
-        return draw_blue_overlay(frame_bgr, det)
-    return draw_grid_overlay(frame_bgr, det)
+    out = render_leader_camera_overlay(frame_bgr, cfg)
+    cached = get_cached_leader_tracking()
+    if cached is None and frame_bgr is not None:
+        cached = fetch_leader_tracking(frame_bgr, cfg)
+    if (
+        cached is not None
+        and cached.found
+        and getattr(cached, "source", None) == "grid"
+    ):
+        out = draw_grid_overlay(out, cached)
+    return out
 
 
 def enrich_follower_debug_masks(frame_bgr, debug, cfg=None):
-    """Add leader-blue HSV mask to lane debug dict for dashboard tuning."""
-    if frame_bgr is None or not debug:
-        return debug
-    lane_cfg = cfg if cfg is not None else load_config()
-    if str(lane_cfg.get("role", "leader")).lower() != "follower":
-        return debug
-    from tasks.project.packages.leader_blue import leader_blue_debug_mask
-    mask = leader_blue_debug_mask(frame_bgr, lane_cfg)
-    if mask is None:
-        return debug
-    out = dict(debug)
-    out["blue_mask"] = mask
-    return out
+    """Lane debug masks only — leader detections are drawn on the main camera."""
+    return debug
+
+
+def get_intersection_turn_params(cfg=None):
+    """Timed intersection turn settings from project_config (for web UI)."""
+    if cfg is None:
+        params = _intersection_turn_from_cfg(load_config())
+    else:
+        params = _intersection_turn_from_cfg(cfg)
+    return {"config_path": _CONFIG_PATH, **params}
+
+
+def patch_intersection_turn_params(updates):
+    """Merge intersection turn timing into project_config.yaml."""
+    validated: Dict[str, Any] = {}
+    for key in _INTERSECTION_TURN_KEYS:
+        if key in (updates or {}):
+            validated[key] = float(updates[key])
+
+    for key in _INTERSECTION_TURN_KEYS:
+        if key in validated:
+            validated[key] = max(0.0, float(validated[key]))
+    for key in ("intersection_turn_straight_s", "intersection_turn_left_s", "intersection_turn_right_s"):
+        if key in validated:
+            validated[key] = max(0.2, float(validated[key]))
+    if "intersection_turn_speed" in validated:
+        validated["intersection_turn_speed"] = min(
+            1.0, max(0.05, float(validated["intersection_turn_speed"])),
+        )
+    for key in ("intersection_turn_inner_ratio", "intersection_turn_outer_ratio"):
+        if key in validated:
+            validated[key] = min(1.0, max(0.05, float(validated[key])))
+
+    raw = _merge_project_config_raw(validated)
+    params = _intersection_turn_from_cfg(raw)
+    _publish_runtime_intersection_turn(params)
+    print(
+        f"[Project] Intersection turn saved to {_CONFIG_PATH}: "
+        f"straight={params['intersection_turn_straight_s']:.2f}s "
+        f"left_arc={params['intersection_turn_left_s']:.2f}s "
+        f"right_arc={params['intersection_turn_right_s']:.2f}s "
+        f"speed={params['intersection_turn_speed']:.2f}",
+        flush=True,
+    )
+    return {"status": "ok", "config_path": _CONFIG_PATH, **params}
+
+
+def get_spacing_params(cfg=None):
+    """Follower convoy spacing settings (for web UI)."""
+    c = load_config() if cfg is None else cfg
+    return {
+        "config_path": _CONFIG_PATH,
+        "leader_detector_span_target_px": float(c.get("leader_detector_span_target_px", 38.0)),
+        "span_target_px": float(c.get("span_target_px", 7.0)),
+        "spacing_kp": float(c.get("spacing_kp", 0.012)),
+        "spacing_kd": float(c.get("spacing_kd", 0.022)),
+        "follower_catchup_margin": float(c.get("follower_catchup_margin", 0.06)),
+        "span_too_close_px": float(c.get("span_too_close_px", 18.0)),
+    }
+
+
+def patch_spacing_params(updates):
+    """Merge follower spacing into project_config.yaml (applies on next control frame)."""
+    validated: Dict[str, Any] = {}
+    float_keys = (
+        "leader_detector_span_target_px",
+        "span_target_px",
+        "spacing_kp",
+        "spacing_kd",
+        "follower_catchup_margin",
+        "span_too_close_px",
+    )
+    for key in float_keys:
+        if key in (updates or {}):
+            validated[key] = float(updates[key])
+
+    if "leader_detector_span_target_px" in validated:
+        validated["leader_detector_span_target_px"] = max(
+            8.0, min(200.0, float(validated["leader_detector_span_target_px"])),
+        )
+    if "span_target_px" in validated:
+        validated["span_target_px"] = max(2.0, float(validated["span_target_px"]))
+    if "spacing_kp" in validated:
+        validated["spacing_kp"] = min(0.08, max(0.001, float(validated["spacing_kp"])))
+    if "spacing_kd" in validated:
+        validated["spacing_kd"] = min(0.1, max(0.0, float(validated["spacing_kd"])))
+    if "follower_catchup_margin" in validated:
+        validated["follower_catchup_margin"] = min(
+            0.35, max(0.0, float(validated["follower_catchup_margin"])),
+        )
+    if "span_too_close_px" in validated:
+        validated["span_too_close_px"] = max(4.0, float(validated["span_too_close_px"]))
+
+    raw = _merge_project_config_raw(validated)
+    params = get_spacing_params(raw)
+    print(
+        f"[Project] Spacing saved to {_CONFIG_PATH}: "
+        f"det_target={params['leader_detector_span_target_px']:.0f}px "
+        f"grid_target={params['span_target_px']:.1f}px",
+        flush=True,
+    )
+    return {"status": "ok", "config_path": _CONFIG_PATH, **params}
 
 
 def set_lane_agent(lane_agent: LaneServoingAgent) -> None:
@@ -1381,7 +1639,7 @@ def _drive_follower(
     else:
         left_pwm, right_pwm = commanded_speed, commanded_speed
 
-    if wheels is not None and is_driving_enabled():
+    if wheels is not None and _follower_wheels_allowed():
         # Cruise/convoy: scale lane steer to spacing speed. Intersection arcs: absolute PWM.
         use_direct = bool(intersection_pwm)
         _apply_lane_wheels(wheels, left_pwm, right_pwm, commanded_speed, use_direct)
@@ -1389,6 +1647,19 @@ def _drive_follower(
     elif wheels is not None:
         _safe_stop(wheels)
     return commanded_speed
+
+
+def _follower_spacing_targets(cfg, leader_source):
+    """Live spacing targets from project_config (refreshed every control frame)."""
+    if leader_source == "detector":
+        return (
+            float(cfg.get("leader_detector_span_target_px", 38.0)),
+            leader_spacing_too_close_for_source(cfg, "detector"),
+        )
+    return (
+        float(cfg.get("span_target_px", 7.0)),
+        leader_spacing_too_close_for_source(cfg, "grid"),
+    )
 
 
 def _follower_cruise_target_speed(
@@ -1401,6 +1672,7 @@ def _follower_cruise_target_speed(
     leader_visible,
     leader_grid_samples,
     last_span_px,
+    leader_source=None,
 ):
     """Spacing speed for normal cruise — conservative at startup, never blind full throttle."""
     if not leader_visible:
@@ -1409,7 +1681,11 @@ def _follower_cruise_target_speed(
         fallback = float(cfg.get("follower_lane_fallback_speed", cruise_speed))
         return max(follower_min, min(follower_max, fallback))
 
-    target_speed = spacing.compute_target_speed(cfg, follower_min, follower_max)
+    span_target, span_too_close = _follower_spacing_targets(cfg, leader_source)
+    target_speed = spacing.compute_target_speed(
+        cfg, follower_min, follower_max,
+        span_target=span_target, span_too_close=span_too_close,
+    )
 
     warmup = max(1, int(cfg.get("follower_spacing_warmup_frames", 8)))
     if leader_grid_samples < warmup:
@@ -1418,11 +1694,10 @@ def _follower_cruise_target_speed(
     catchup = max(0.0, float(cfg.get("follower_catchup_margin", 0.06)))
     target_speed = min(target_speed, cruise_speed + catchup)
 
-    too_close_px = float(cfg.get("span_too_close_px", 44.0))
-    if last_span_px is not None and last_span_px >= too_close_px:
+    if last_span_px is not None and last_span_px >= span_too_close:
         target_speed = min(
             target_speed,
-            float(cfg.get("span_too_close_speed", 0.06)),
+            float(cfg.get("span_too_close_speed", 0.05)),
         )
     return max(follower_min, min(follower_max, target_speed))
 
@@ -1434,8 +1709,8 @@ def _follower_intersection_turn_speed(cfg, cruise_speed):
 
 
 def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
-    cruise_speed = float(cfg.get("cruise_speed", 0.4))
-    slow_speed = float(cfg.get("slow_speed", 0.15))
+    cruise_speed = float(cfg.get("cruise_speed", 0.32))
+    slow_speed = float(cfg.get("slow_speed", 0.16))
     stop_hold_s = float(cfg.get("stop_hold_s", 2.0))
     decel_time_s = float(cfg.get("decel_time_s", 1.2))
     decel_steps = int(cfg.get("decel_steps", 10))
@@ -1522,13 +1797,11 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             current_speed = 0.0
             _safe_stop(wheels)
             _remember_lane_pwm(_get_lane_agent(), 0.0, 0.0)
-            if now >= stop_until and (
-                event == EVENT_NORMAL or bool(_sign_runtime.get("stop_tag_latch_resume"))
-            ):
-                if _sign_runtime.pop("stop_tag_latch_resume", False):
+            if now >= stop_until and event == EVENT_NORMAL:
+                if _sign_runtime.pop("stop_pending_rearm", False):
                     rearm_s = float(cfg.get("sign_stop_rearm_s", 6.0))
                     _sign_runtime["stop_rearm_until"] = now + max(0.0, rearm_s)
-                    _reset_stop_loss_tracker()
+                    _reset_stop_tracker()
                     print(
                         f"[Project][Leader] Tag stop hold done; ignore stop tags for {rearm_s:.1f}s",
                         flush=True,
@@ -1591,20 +1864,39 @@ def run_leader(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     print("[Project][Leader] Stopped.")
  
  
+def _update_intersection_turn_tracker(turn_tracker, leader_det):
+    """Intersection memory from the same leader sample used for spacing (no extra inference)."""
+    if leader_det is None or not leader_det.found:
+        return
+    turn_tracker.update(leader_det)
+
+
+def _intersection_turn_fallback_sample(cfg):
+    """Last leader sample for red-line infer — never mix grid when detector is ready."""
+    if leader_detector_ready(cfg):
+        return get_cached_leader_detector()
+    cached = get_cached_grid_detection()
+    if cached is not None and cached.found:
+        cached.source = "grid"
+    return cached
+
+
 def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     grid_hz = max(1.0, float(cfg.get("grid_detect_hz", 10)))
     grid_dt = 1.0 / grid_hz
-    cruise_speed = float(cfg.get("cruise_speed", 0.4))
-    slow_speed = float(cfg.get("slow_speed", 0.15))
-    follower_max = float(cfg.get("follower_max_speed", 0.4))
+    cruise_speed = float(cfg.get("cruise_speed", 0.32))
+    slow_speed = float(cfg.get("slow_speed", 0.16))
+    follower_max = float(cfg.get("follower_max_speed", 0.368))
     follower_min = float(cfg.get("follower_min_speed", 0.0))
     loss_confirm = max(1, int(cfg.get("leader_loss_confirm_frames", 3)))
     red_confirm = max(1, int(cfg.get("intersection_red_confirm_frames", 3)))
     span_target = float(cfg.get("span_target_px", 32.0))
+    det_span_target = float(cfg.get("leader_detector_span_target_px", 38.0))
     print("[Project][Follower] Lane control: one update per camera frame (like visual_lane_servoing).")
     print(
-        f"[Project][Follower] span_target={span_target:.0f}px; "
-        f"red-line intersection ({int(cfg.get('grid_cols', 7))}x{int(cfg.get('grid_rows', 3))} grid + blue fallback at {grid_hz:.1f} Hz).",
+        f"[Project][Follower] spacing grid_target={span_target:.0f}px "
+        f"detector_target={det_span_target:.0f}px; "
+        f"red-line intersection (YOLO truck turns; grid turns only if model unloaded).",
         flush=True,
     )
 
@@ -1628,9 +1920,16 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
     intersection_preamble_end = 0.0
     intersection_arc_end = 0.0
     intersection_end = 0.0
+    last_leader_source = None
+    last_spacing_target = span_target
     last_leader_seen_ts = 0.0
 
     while not stop_event.is_set():
+        cfg = load_config()
+        cruise_speed = float(cfg.get("cruise_speed", 0.32))
+        slow_speed = float(cfg.get("slow_speed", 0.16))
+        follower_max = float(cfg.get("follower_max_speed", 0.368))
+        follower_min = float(cfg.get("follower_min_speed", 0.0))
         now = time.time()
         frame_dt = max(1e-3, now - last_drive_ts)
         last_drive_ts = now
@@ -1645,15 +1944,23 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 leader_loss_streak = 0
                 leader_visible = True
                 last_leader_seen_ts = now
+                last_leader_source = getattr(leader_det, "source", None)
                 leader_grid_samples = min(leader_grid_samples + 1, 1000)
                 last_distance_signal = leader_det.distance_signal
+                _update_intersection_turn_tracker(turn_tracker, leader_det)
                 if leader_det.span_px is not None:
                     spacing_span = leader_spacing_span_px(leader_det, cfg)
                     if spacing_span is not None:
                         last_span_px = spacing_span
-                        spacing.observe(spacing_span, now, cfg, commanded_speed)
-                if turn_tracker.approach_active:
-                    turn_tracker.update(leader_det)
+                        last_spacing_target = leader_spacing_target_px(leader_det, cfg)
+                        spacing.observe(
+                            spacing_span,
+                            now,
+                            cfg,
+                            commanded_speed,
+                            span_target=last_spacing_target,
+                            span_too_close=leader_spacing_too_close_px(leader_det, cfg),
+                        )
             else:
                 leader_loss_streak += 1
                 if leader_loss_streak >= loss_confirm:
@@ -1665,21 +1972,52 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         else:
             line_streak = 0
 
+        pending_turn = _pop_follower_test_turn()
+        if pending_turn is not None:
+            intersection_direction = pending_turn
+            intersection_phase = "TURN"
+            intersection_turn_start = now
+            _set_follower_test_turn_active(True)
+            (
+                intersection_preamble_end,
+                intersection_arc_end,
+                intersection_end,
+                schedule,
+            ) = intersection_phase_deadlines(
+                intersection_turn_start, intersection_direction, cfg,
+            )
+            line_streak = 0
+            turn_tracker.reset()
+            print(
+                f"[Project][Follower] Manual test turn: {intersection_direction} "
+                f"(no Start required) preamble={schedule['preamble_s']:.1f}s "
+                f"arc={schedule['arc_s']:.1f}s tail={schedule['tail_s']:.1f}s",
+                flush=True,
+            )
+
         if (
             line_streak >= red_confirm
             and is_driving_enabled()
             and intersection_phase is None
             and turn_tracker.approach_active
         ):
+            if not turn_tracker.has_last_grid:
+                cached = _intersection_turn_fallback_sample(cfg)
+                if cached is not None and cached.found:
+                    turn_tracker.update(cached)
             frame_w = float(frame_bgr.shape[1]) if frame_bgr is not None else 640.0
             turn_dbg = turn_tracker.debug_votes(cfg, frame_w=frame_w)
             intersection_direction = turn_tracker.infer(cfg, frame_w=frame_w)
             intersection_phase = "TURN"
-            schedule = intersection_turn_schedule(intersection_direction, cfg)
             intersection_turn_start = now
-            intersection_preamble_end = now + schedule["preamble_s"]
-            intersection_arc_end = intersection_preamble_end + schedule["arc_s"]
-            intersection_end = intersection_arc_end + schedule["tail_s"]
+            (
+                intersection_preamble_end,
+                intersection_arc_end,
+                intersection_end,
+                schedule,
+            ) = intersection_phase_deadlines(
+                intersection_turn_start, intersection_direction, cfg,
+            )
             print(
                 f"[Project][Follower] Red line — turn {intersection_direction} "
                 f"(last={turn_dbg['last_source']} "
@@ -1699,6 +2037,14 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
 
         if intersection_phase == "TURN":
             mode = STATE_INTERSECTION
+            (
+                intersection_preamble_end,
+                intersection_arc_end,
+                intersection_end,
+                _ix_schedule,
+            ) = intersection_phase_deadlines(
+                intersection_turn_start, intersection_direction, cfg,
+            )
             turn_speed = _follower_intersection_turn_speed(cfg, cruise_speed)
             target_speed = turn_speed
             if intersection_direction == TURN_STRAIGHT:
@@ -1730,6 +2076,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
                 intersection_direction = None
                 line_streak = 0
                 turn_tracker.reset()
+                _set_follower_test_turn_active(False)
                 mode = STATE_CRUISING
                 wheel_pwm = None
                 intersection_pwm = False
@@ -1747,6 +2094,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             target_speed = _follower_cruise_target_speed(
                 spacing, cfg, follower_min, follower_max, cruise_speed, slow_speed,
                 leader_visible, leader_grid_samples, last_span_px,
+                leader_source=last_leader_source,
             )
 
         commanded_speed = _drive_follower(
@@ -1775,18 +2123,32 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
             red_near_px=red_prox.near_px,
             red_at_line=red_prox.at_line,
             tag_ids=[],
+            test_turn_active=_follower_wheels_allowed() and not is_driving_enabled(),
         )
 
         if now - last_log >= 2.0:
             dist_str = f"{last_distance_signal:.3f}" if last_distance_signal is not None else "-"
             span_str = f"{last_span_px:.1f}" if last_span_px is not None else "-"
+            spacing_tgt, _ = _follower_spacing_targets(
+                cfg, last_leader_source or "detector",
+            )
+            src_str = last_leader_source or "-"
+            ix_extra = ""
+            if intersection_phase == "TURN":
+                _sched = intersection_turn_schedule(intersection_direction, cfg)
+                ix_extra = (
+                    f" ix_arc={_sched['arc_s']:.2f}s"
+                    f" ix_left={float(cfg.get('intersection_turn_left_s', 0)):.2f}"
+                    f" ix_right={float(cfg.get('intersection_turn_right_s', 0)):.2f}"
+                )
             print(
                 f"[Project][Follower] mode={mode} follow={follow_mode} "
                 f"target={target_speed:.2f} cmd={commanded_speed:.2f} "
-                f"span={span_str}/{span_target:.0f} span_dot={spacing.span_dot:.1f} "
+                f"span={span_str}/{spacing_tgt:.0f} src={src_str} "
+                f"span_dot={spacing.span_dot:.1f} "
                 f"v_leader={spacing.v_leader_est:.2f} dist={dist_str} "
                 f"leader={leader_visible} red={red_prox.near_px} at_line={red_prox.at_line} "
-                f"intersection={intersection_phase} turn={intersection_direction}"
+                f"intersection={intersection_phase} turn={intersection_direction}{ix_extra}"
             )
             last_log = now
 
@@ -1809,6 +2171,7 @@ def run_follower(camera, wheels, leds, stop_event, cfg: Dict[str, Any]) -> None:
         tag_ids=[],
     )
     _safe_stop(wheels)
+    _set_follower_test_turn_active(False)
     _convoy_leds_off(leds)
     print("[Project][Follower] Stopped.")
  

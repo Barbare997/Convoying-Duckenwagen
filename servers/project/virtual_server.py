@@ -27,11 +27,16 @@ from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.visual_lane_servoing.packages import visual_servoing_activity as _lane_activity
 from tasks.project.packages.leader_grid import reset_grid_tracker
 import tasks.project.packages.agent as agent
+from servers.project.detector_init import start_leader_detector_background
+from servers.project.intersection_turn_api import register_intersection_turn_routes
+from servers.project.spacing_api import register_spacing_routes
 
 LANE_CONFIG_FILE = os.path.join(project_root, 'config', 'lane_servoing_config.yaml')
 LANE_HSV_CONFIG_FILE = os.path.join(project_root, 'config', 'lane_servoing_hsv_config.yaml')
 
 app = Flask(__name__)
+register_intersection_turn_routes(app)
+register_spacing_routes(app)
 camera = None
 wheels = None
 stop_event = threading.Event()
@@ -73,15 +78,24 @@ def _feed_convoy_frame(frame_bgr):
             pass
 
 
+_last_display_mask_ts = 0.0
+
+
 def _refresh_display_masks(frame_bgr):
-    """Dashboard masks: full frame like visual_lane_servoing (no bottom crop)."""
+    """Dashboard masks: reuse control-loop lane debug when the stream is faster than driving."""
+    global _last_display_mask_ts
     if _lane_agent is None or frame_bgr is None:
         return
+    now = time.time()
+    if now - _last_display_mask_ts < 0.2:
+        return
+    _last_display_mask_ts = now
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     _lane_agent.compute_commands(frame_rgb, ignore_bottom_frac=0.0, debug_red_mask=True)
 
 
 def _apply_follower_grid_overlay(frame_bgr):
+    """Draw YOLO detections on camera; grid only when detector misses leader."""
     if frame_bgr is None:
         return frame_bgr
     try:
@@ -289,8 +303,9 @@ def main():
     print('=' * 60)
     print(f'Role: {role}  (set in config/project_config.yaml)')
     if role == 'follower':
-        print('Follower sim: NPC leader with MarkerGridBoard on project_convoy.tscn')
-        print('  1. Wait ~4s after load for NPC to depart (camera grace)')
+        print('Follower sim: YOLO truck tracking + grid fallback')
+        start_leader_detector_background()
+        print('  1. Wait for model loaded in UI (~seconds sim, ~1 min TRT on bot)')
         print('  2. leader_visible=no still lane-follows; yes enables convoy spacing')
         print('  3. Click Start to drive')
     else:

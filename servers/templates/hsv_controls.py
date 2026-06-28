@@ -306,6 +306,7 @@ HSV_EXTRA_JS = '''
             formatBounds('r', data.suggested_red);
         document.getElementById('pick-white').textContent =
             formatBounds('w', data.suggested_white);
+        if (window.onPixelSample) window.onPixelSample(data);
     }
 
     function applyPickedColor(which) {

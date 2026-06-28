@@ -57,10 +57,10 @@ class _LastLeaderSample(object):
 
 
 class LeaderTurnTracker(object):
-    """Remember last leader sighting during red approach; infer turn from it.
+    """Remember last leader sighting; infer turn from placement at red line.
 
-    Grid gives heading when visible; blue body center-x is kept when the grid
-    drops out (common right as the leader yaws at an intersection).
+    Updates whenever the leader is seen (not only during red approach).
+    Grid uses dot heading; YOLO detector uses bbox center placement in frame.
     """
 
     def __init__(self, window=20):
@@ -85,21 +85,17 @@ class LeaderTurnTracker(object):
             return
         self._cx.append(cx)
         aspect = grid_bbox_aspect(det)
-        source = getattr(det, "source", None) or ("grid" if det.heading is not None else "blue")
-        if source == "grid" and det.heading is not None:
+        source = getattr(det, "source", None) or ("grid" if det.heading is not None else "detector")
+        if source in ("grid", "detector") and det.heading is not None:
             heading = float(det.heading)
-            self._last = _LastLeaderSample(cx, heading, aspect, "grid")
+            self._last = _LastLeaderSample(cx, heading, aspect, source)
         else:
-            self._last = _LastLeaderSample(cx, None, aspect, "blue")
+            self._last = _LastLeaderSample(cx, None, aspect, source or "detector")
 
     def begin_approach_if_needed(self, red_prox, cfg):
-        """Clear stale samples when red first shows in the far band."""
+        """Latch red approach — keep last leader memory from before the intersection."""
         min_far = int(cfg.get("intersection_red_approach_min_far_px", 600))
-        approaching = red_prox.far_px >= min_far
-        if approaching and not self._approach_active:
-            self._cx.clear()
-            self._last = None
-        self._approach_active = approaching
+        self._approach_active = red_prox.far_px >= min_far
 
     @property
     def approach_active(self):
@@ -136,8 +132,31 @@ class LeaderTurnTracker(object):
 
     def _infer_from_center(self, last, cfg, frame_w):
         cx_offset_thresh = float(cfg.get("intersection_last_cx_offset_px", 28.0))
-        straight_center = float(cfg.get("intersection_blue_straight_center_px", 18.0))
+        straight_center = float(
+            cfg.get(
+                "intersection_straight_center_px",
+                cfg.get("intersection_blue_straight_center_px", 18.0),
+            )
+        )
+        straight_aspect = float(cfg.get("intersection_straight_aspect_min", 2.2))
         offset = float(last.center_x) - (frame_w / 2.0)
+
+        if last.source == "detector":
+            if (
+                last.aspect is not None
+                and last.aspect >= straight_aspect
+                and abs(offset) <= straight_center
+            ):
+                return TURN_STRAIGHT
+            if offset >= cx_offset_thresh:
+                return TURN_RIGHT
+            if offset <= -cx_offset_thresh:
+                return TURN_LEFT
+            trend_vote = self._cx_trend_turn(cfg)
+            if trend_vote != TURN_STRAIGHT:
+                return trend_vote
+            return TURN_STRAIGHT
+
         if abs(offset) <= straight_center:
             trend_vote = self._cx_trend_turn(cfg)
             if trend_vote == TURN_STRAIGHT:
@@ -158,11 +177,13 @@ class LeaderTurnTracker(object):
             return TURN_STRAIGHT
 
         frame_w = max(1.0, float(frame_w))
-        straight_aspect = float(cfg.get("intersection_straight_aspect_min", 2.2))
-        heading_thresh = float(cfg.get("intersection_heading_thresh", 0.12))
+
+        if last.source == "detector":
+            return self._infer_from_center(last, cfg, frame_w)
 
         if last.source == "grid" and last.heading is not None:
-            # Face-on grid + weak heading on the last frame -> straight through.
+            straight_aspect = float(cfg.get("intersection_straight_aspect_min", 2.2))
+            heading_thresh = float(cfg.get("intersection_heading_thresh", 0.12))
             if last.aspect is not None and last.aspect >= straight_aspect:
                 if abs(float(last.heading)) < heading_thresh * 0.45:
                     return TURN_STRAIGHT
@@ -301,6 +322,15 @@ def intersection_turn_schedule(direction, cfg):
         "arc_s": max(0.2, float(cfg.get("intersection_turn_straight_s", 1.4))),
         "tail_s": 0.0,
     }
+
+
+def intersection_phase_deadlines(turn_start: float, direction, cfg):
+    """Phase end timestamps from turn start + current config (live UI tuning)."""
+    schedule = intersection_turn_schedule(direction, cfg)
+    preamble_end = turn_start + schedule["preamble_s"]
+    arc_end = preamble_end + schedule["arc_s"]
+    end = arc_end + schedule["tail_s"]
+    return preamble_end, arc_end, end, schedule
 
 
 def intersection_wheel_commands(direction, cfg, speed=None):

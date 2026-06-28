@@ -4,16 +4,12 @@ extends MeshInstance3D
 ## finds this with cv2.findCirclesGrid. Built at runtime so adding it needs no
 ## texture-import step (headless sim runs don't re-import assets).
 
-# Sized so the follower's tracker resolves the dots at convoy distances:
-# with the 640x480 sim camera (~75 deg fov) and the tracker's 0.5 downscale,
-# these dots stay above SimpleBlobDetector's min area out to ~1.5 m, and the
-# follow config's span thresholds (stop 70 px / safe 18 px) map to ~0.25 m
-# and ~0.95 m gaps.
+# Compact rear strip (~11 cm wide) — same VehicleCorected body as object_detection sim.
 @export var cols: int = 7
 @export var rows: int = 3
-@export var spacing_m: float = 0.042
-@export var dot_radius_m: float = 0.013
-@export var margin_m: float = 0.024
+@export var spacing_m: float = 0.016
+@export var dot_radius_m: float = 0.006
+@export var margin_m: float = 0.009
 @export var px_per_m: float = 1500.0
 
 func _ready() -> void:

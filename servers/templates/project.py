@@ -1,5 +1,8 @@
 from .base import render_template
 from .hsv_controls import HSV_CARD_HTML, HSV_EXTRA_CSS, HSV_EXTRA_JS, HSV_VIDEO_HINT
+from .project_leader_detector_ui import LEADER_DETECTOR_CARD, LEADER_DETECTOR_JS
+from .project_intersection_turn_ui import INTERSECTION_TURN_CARD, INTERSECTION_TURN_JS
+from .project_spacing_ui import SPACING_CARD, SPACING_JS
 
 _EXTRA_CSS = HSV_EXTRA_CSS + '''
 .info-box {
@@ -37,6 +40,12 @@ _CONTENT = f'''
 
 {HSV_CARD_HTML}
 
+{LEADER_DETECTOR_CARD}
+
+{SPACING_CARD}
+
+{INTERSECTION_TURN_CARD}
+
             <div class="card">
                 <div class="card-header">Drive Control</div>
                 <p style="font-size:12px;color:var(--text-muted);margin:0 0 12px">
@@ -67,7 +76,7 @@ _CONTENT = f'''
             </div>
 
             <div class="card" id="followerGridCard" style="display:none">
-                <div class="card-header">Leader Grid (OpenCV)</div>
+                <div class="card-header">Leader Tracking</div>
                 <div id="gridStatusLine">Ready</div>
             </div>
 
@@ -120,7 +129,7 @@ _CONTENT = f'''
     </div>
 '''
 
-_JS = HSV_EXTRA_JS + '''
+_JS = HSV_EXTRA_JS + LEADER_DETECTOR_JS + SPACING_JS + INTERSECTION_TURN_JS + '''
     let _manualCommand = 'CRUISING';
 
     function setRunningUI(isRunning) {
@@ -176,17 +185,25 @@ _JS = HSV_EXTRA_JS + '''
             el.innerHTML = '<span class="warn">Grid detector not ready</span>';
             return;
         }
-        const pat = grid.pattern || '7x3';
-        const seen = grid.last_found ? 'grid seen' : 'searching…';
-        el.innerHTML = '<span class="ok">Circle grid ' + pat + ' — ' + seen + '</span>';
+        const src = grid.method || 'none';
+        const seen = grid.last_found ? (src + ' seen') : 'searching…';
+        const score = grid.score != null ? ' conf=' + Number(grid.score).toFixed(2) : '';
+        const span = grid.span_px != null ? ' span=' + grid.span_px + 'px' : '';
+        el.innerHTML = '<span class="ok">' + seen + score + span + '</span>';
     }
 
     function updateRolePanels(data) {
         const role = (data.role || 'leader').toLowerCase();
         const leaderCard = document.getElementById('convoySignCard');
         const gridCard = document.getElementById('followerGridCard');
+        const detCard = document.getElementById('leaderDetectorCard');
+        const ixCard = document.getElementById('intersectionTurnCard');
+        const spCard = document.getElementById('spacingCard');
         if (leaderCard) leaderCard.style.display = role === 'leader' ? 'block' : 'none';
         if (gridCard) gridCard.style.display = role === 'follower' ? 'block' : 'none';
+        if (detCard) detCard.style.display = role === 'follower' ? 'block' : 'none';
+        if (spCard) spCard.style.display = role === 'follower' ? 'block' : 'none';
+        if (ixCard) ixCard.style.display = role === 'follower' ? 'block' : 'none';
         if (role === 'leader') {
             const cmd = data.manual_command || _manualCommand || 'CRUISING';
             _manualCommand = cmd;
@@ -194,6 +211,7 @@ _JS = HSV_EXTRA_JS + '''
         }
         if (role === 'follower') {
             renderGridStatus(data.grid);
+            renderDetectorStatus(data.detector);
         }
     }
 
@@ -242,6 +260,8 @@ _JS = HSV_EXTRA_JS + '''
                 }
                 if (data.role === 'follower') {
                     rows.push(['leader_visible', data.leader_visible ? 'yes' : 'no']);
+                    rows.push(['track_source', (data.grid && data.grid.method) || '-']);
+                    rows.push(['model_loaded', (data.detector && data.detector.model_loaded) ? 'yes' : 'no']);
                     rows.push(['follow_mode', data.follow_mode || '-']);
                     rows.push(['intersection', data.intersection_phase || '-']);
                     rows.push(['turn', data.intersection_turn || '-']);
@@ -261,6 +281,8 @@ _JS = HSV_EXTRA_JS + '''
 
     refreshConvoyStatus();
     setInterval(refreshConvoyStatus, 400);
+    bindSpacingSliders();
+    loadSpacingParams();
 '''
 
 

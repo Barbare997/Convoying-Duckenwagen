@@ -13,6 +13,17 @@ INFO_STRIP_H = 120
 _YELLOW_TOL = (10, 60, 60)  # h, s, v
 _WHITE_TOL = (20, 50, 50)
 _RED_TOL = (10, 60, 60)
+_LEADER_BLUE_TOL = (12, 55, 55)
+
+
+def _suggest_leader_blue(h: int, s: int, v: int) -> Dict[str, int]:
+    th, ts, tv = _LEADER_BLUE_TOL
+    return {
+        "h_min": int(np.clip(h - th, 0, 179)),
+        "h_max": int(np.clip(h + th, 0, 179)),
+        "s_min": int(np.clip(s - ts, 0, 255)),
+        "v_min": int(np.clip(v - tv, 0, 255)),
+    }
 
 
 def _display_h(frame_h: int, frame_w: int) -> int:
@@ -108,6 +119,7 @@ def sample_pixel_from_frame_bgr(
         "suggested_yellow": _suggest_bounds(h, s, v, _YELLOW_TOL),
         "suggested_white": _suggest_bounds(h, s, v, _WHITE_TOL),
         "suggested_red": _suggest_bounds(h, s, v, _RED_TOL),
+        "suggested_leader_blue": _suggest_leader_blue(h, s, v),
         "frame_size": {"width": frame_w, "height": frame_h},
         "camera_panel": {"width": VIZ_PANEL_W, "height": _display_h(frame_h, frame_w)},
     }

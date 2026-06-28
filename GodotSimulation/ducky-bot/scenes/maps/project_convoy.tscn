@@ -6,9 +6,8 @@
 [ext_resource type="PackedScene" path="res://scenes/tiles/tile_cross.tscn" id="4_n2i8c"]
 [ext_resource type="PackedScene" path="res://scenes/robot/duckie_bot.tscn" id="6_ff2ma"]
 [ext_resource type="Script" path="res://scripts/Moveee.gd" id="7_qptx7"]
-[ext_resource type="PackedScene" path="res://scenes/robot/duckie_bot_npc.tscn" id="8_npcbt"]
 [ext_resource type="Script" path="res://scripts/NpcLeaderStart.gd" id="9_pfwlo"]
-[ext_resource type="Script" path="res://scripts/MarkerGridBoard.gd" id="10_mgrid"]
+[ext_resource type="PackedScene" path="res://scenes/robot/od_truck.tscn" id="10_odtruck"]
 
 [sub_resource type="Curve3D" id="Curve3D_kiuloop"]
 _data = {
@@ -154,13 +153,10 @@ curve = SubResource("Curve3D_kiuloop")
 
 [node name="PathFollower" type="PathFollow3D" parent="NPCPath" unique_id=1750397962]
 script = ExtResource("9_pfwlo")
-speed = 0.4
+speed = 0.32
 
-[node name="DuckieBot_NPC" parent="NPCPath/PathFollower" unique_id=95641082 instance=ExtResource("8_npcbt")]
-
-[node name="MarkerBoard" type="MeshInstance3D" parent="NPCPath/PathFollower/DuckieBot_NPC" unique_id=95641083]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.125, 0.145)
-script = ExtResource("10_mgrid")
+[node name="LeaderTruck" parent="NPCPath/PathFollower" instance=ExtResource("10_odtruck")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.047, 0)
 
 [node name="Sun" type="DirectionalLight3D" parent="." unique_id=1207602467]
 transform = Transform3D(0.8660254, -0.4829629, 0.12940954, 0, 0.25881907, 0.9659258, -0.5, -0.83651626, 0.22414389, 4.8, 20, 4.8)

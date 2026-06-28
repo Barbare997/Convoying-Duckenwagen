@@ -253,8 +253,9 @@ function syncSliderInput(sliderId, callback) {
     });
 
     input.addEventListener('input', function() {
-        let val = parseInt(this.value);
-        val = Math.max(parseInt(this.min), Math.min(parseInt(this.max), val));
+        let val = parseFloat(this.value);
+        if (!Number.isFinite(val)) return;
+        val = Math.max(parseFloat(this.min), Math.min(parseFloat(this.max), val));
         this.value = val;
         slider.value = val;
         clearTimeout(timeout);

@@ -103,6 +103,9 @@ from tasks.visual_lane_servoing.packages.agent import LaneServoingAgent
 from tasks.visual_lane_servoing.packages import visual_servoing_activity as _lane_activity
 
 import tasks.project.packages.agent as agent
+from servers.project.detector_init import start_leader_detector_background
+from servers.project.intersection_turn_api import register_intersection_turn_routes
+from servers.project.spacing_api import register_spacing_routes
 
 
 
@@ -113,6 +116,8 @@ LANE_HSV_CONFIG_FILE = os.path.join(project_root, 'config', 'lane_servoing_hsv_c
 
 
 app        = Flask(__name__)
+register_intersection_turn_routes(app)
+register_spacing_routes(app)
 
 camera     = None
 
@@ -188,16 +193,24 @@ class QueuedCamera:
 
 
 
+_last_display_mask_ts = 0.0
+
+
 def _refresh_display_masks(frame_bgr):
-    """Dashboard masks: full frame like visual_lane_servoing (no bottom crop)."""
+    """Dashboard masks: reuse control-loop lane debug when the stream is faster than driving."""
+    global _last_display_mask_ts
     if _lane_agent is None or frame_bgr is None:
         return
+    now = time.time()
+    if now - _last_display_mask_ts < 0.2:
+        return
+    _last_display_mask_ts = now
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     _lane_agent.compute_commands(frame_rgb, ignore_bottom_frac=0.0, debug_red_mask=True)
 
 
 def _apply_follower_grid_overlay(frame_bgr):
-    """Draw circle-grid dots on the camera panel (follower only)."""
+    """Draw YOLO detections on camera; grid only when detector misses leader."""
     if frame_bgr is None:
         return frame_bgr
     try:
@@ -829,6 +842,10 @@ def main():
     agent.set_lane_agent(_lane_agent)
 
     agent.set_driving_enabled(False)
+
+    cfg = agent.load_config()
+    if str(cfg.get("role", "leader")).lower() == "follower":
+        start_leader_detector_background()
 
     if PlaceholderCamera is not None:
         camera = PlaceholderCamera()

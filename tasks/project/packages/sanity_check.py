@@ -53,7 +53,7 @@ def test_next_state_transitions():
 def test_smooth_stop():
     wheels = DummyWheels()
     stop_event = threading.Event()
-    agent.smooth_stop(wheels, current_speed=0.4, decel_time_s=0.05, decel_steps=4, stop_event=stop_event)
+    agent.smooth_stop(wheels, current_speed=0.32, decel_time_s=0.05, decel_steps=4, stop_event=stop_event)
     assert wheels.commands, "smooth_stop produced no wheel commands"
     assert wheels.commands[-1] == (0.0, 0.0), "smooth_stop did not end at full stop"
     print("OK: smooth_stop reaches zero")
@@ -119,12 +119,12 @@ def test_grid_spacing_controller():
     ctl = GridSpacingController()
     ctl.observe(28.0, 0.0, cfg, 0.35)
     ctl.observe(28.0, 0.1, cfg, 0.35)
-    v_far = ctl.compute_target_speed(cfg, 0.0, 0.48)
-    assert v_far > 0.2, "below span_target should catch up"
+    v_far = ctl.compute_target_speed(cfg, 0.0, 0.368)
+    assert v_far > 0.16, "below span_target should catch up"
 
     ctl.observe(38.0, 0.2, cfg, 0.35)
     ctl.observe(40.0, 0.3, cfg, 0.35)
-    v_close = ctl.compute_target_speed(cfg, 0.0, 0.48)
+    v_close = ctl.compute_target_speed(cfg, 0.0, 0.368)
     assert v_close < v_far, "above span_target / closing should slow down"
     print("OK: grid spacing controller")
 
@@ -280,32 +280,141 @@ def test_leader_turn_tracker():
     for cx in range(280, 380, 8):
         tr.update(GridDetection(
             True, 0.5, 0.8, None, pat, bbox=(int(cx) - 40, 60, int(cx) + 40, 140),
-            center_x=float(cx), source="blue",
+            center_x=float(cx), source="detector",
         ))
-    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "blue center drift => right"
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "detector center drift => right"
+
+    tr.reset()
+    for cx in range(280, 380, 8):
+        tr.update(GridDetection(
+            True, 0.5, 0.8, None, pat, bbox=(int(cx) - 40, 60, int(cx) + 40, 140),
+            center_x=float(cx), source="detector",
+        ))
+    tr.begin_approach_if_needed(RedLineProximity(0, 0.0, 500, False), cfg)
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "last leader kept across approach begin"
 
     print("OK: leader turn tracker")
 
 
-def test_leader_blue_detection():
-    from tasks.project.packages.leader_blue import detect_leader_blue
+def test_intersection_turn_uses_detector_not_grid_when_loaded():
+    from tasks.project.packages.agent import _update_intersection_turn_tracker
+    from tasks.project.packages.intersection_follow import LeaderTurnTracker, TURN_LEFT, TURN_RIGHT
+    from tasks.project.packages.leader_detector import (
+        reset_leader_detector_cache,
+        set_detector_agent,
+    )
+    from tasks.project.packages.leader_grid import GridDetection
 
+    class _MockDetAgent(object):
+        model_loaded = True
+
+        def detect(self, frame_rgb):
+            return [((400, 80, 520, 200), 0.9, 1)]
+
+    pat = (7, 3)
+    tr = LeaderTurnTracker(window=10)
     cfg = {
         "role": "follower",
-        "leader_blue_enabled": True,
-        "leader_blue_h_min": 100,
-        "leader_blue_h_max": 125,
-        "leader_blue_s_min": 90,
-        "leader_blue_v_min": 75,
-        "leader_blue_min_area": 400,
+        "leader_detector_enabled": True,
+        "leader_detector_class": 1,
+        "leader_detector_min_area": 400,
+        "grid_cols": 7,
+        "grid_rows": 3,
+        "intersection_last_cx_offset_px": 20,
+        "intersection_heading_thresh": 0.12,
+        "intersection_heading_sign": -1.0,
     }
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.rectangle(frame, (260, 70), (380, 170), (200, 90, 0), -1)
-    det = detect_leader_blue(frame, cfg)
-    assert det.found, "blue duckie blob should be detected"
-    assert det.source == "blue"
+
+    set_detector_agent(_MockDetAgent())
+    reset_leader_detector_cache()
+    tr.update(GridDetection(
+        True, 0.5, 1.0, None, pat, bbox=(100, 50, 200, 110),
+        center_x=150.0, heading=0.15, source="grid",
+    ))
+    assert tr.infer(cfg, frame_w=640.0) == TURN_LEFT, "grid memory says left"
+    det = GridDetection(
+        True, 0.5, 0.9, None, pat, bbox=(400, 80, 520, 200),
+        center_x=460.0, heading=-0.15, source="detector",
+    )
+    _update_intersection_turn_tracker(tr, det)
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "detector overwrites grid memory"
+
+    tr.reset()
+    _update_intersection_turn_tracker(tr, det)
+    assert tr.infer(cfg, frame_w=640.0) == TURN_RIGHT, "detector bbox right of center => right"
+
+    set_detector_agent(None)
+    reset_leader_detector_cache()
+    tr.reset()
+    tr.update(GridDetection(
+        True, 0.5, 1.0, None, pat, bbox=(100, 50, 200, 110),
+        center_x=150.0, heading=0.15, source="grid",
+    ))
+    assert tr.infer(cfg, frame_w=640.0) == TURN_LEFT, "grid heading without detector"
+    print("OK: intersection turn source priority")
+
+
+def test_leader_detector_tracking():
+    from tasks.project.packages.leader_detector import (
+        detect_leader_detector,
+        reset_leader_detector_cache,
+        set_detector_agent,
+    )
+
+    class _MockDetAgent(object):
+        model_loaded = True
+
+        def detect(self, frame_rgb):
+            return [((200, 80, 360, 200), 0.92, 1)]
+
+    set_detector_agent(_MockDetAgent())
+    reset_leader_detector_cache()
+    cfg = {
+        "role": "follower",
+        "leader_detector_enabled": True,
+        "leader_detector_class": 1,
+        "leader_detector_min_area": 400,
+        "grid_cols": 7,
+        "grid_rows": 3,
+        "leader_grid_fallback_enabled": False,
+    }
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    det = detect_leader_detector(frame, cfg)
+    assert det.found, "mock YOLO truck should be detected"
+    assert det.source == "detector"
     assert det.center_x is not None and det.span_px is not None
-    print("OK: leader blue detection")
+    set_detector_agent(None)
+    print("OK: leader detector tracking")
+
+
+def test_leader_detector_spacing_params():
+    from tasks.project.packages.leader_detector import (
+        leader_spacing_span_px,
+        leader_spacing_target_px,
+        leader_spacing_too_close_px,
+    )
+    from tasks.project.packages.leader_grid import GridDetection
+
+    cfg = {
+        "span_target_px": 7.0,
+        "span_too_close_px": 18.0,
+        "leader_detector_span_target_px": 38.0,
+        "grid_cols": 7,
+        "grid_rows": 3,
+    }
+    det = GridDetection(
+        True, 0.5, 0.9, None, (7, 3),
+        span_px=40.0, source="detector",
+    )
+    assert leader_spacing_span_px(det, cfg) == 40.0
+    assert leader_spacing_target_px(det, cfg) == 38.0
+    assert abs(leader_spacing_too_close_px(det, cfg) - 97.7) < 0.2
+
+    grid = GridDetection(True, 0.5, 0.9, None, (7, 3), span_px=6.5, source="grid")
+    assert leader_spacing_target_px(grid, cfg) == 7.0
+    assert leader_spacing_too_close_px(grid, cfg) == 18.0
+    print("OK: leader detector spacing params")
 
 
 def test_role_dispatch():
@@ -350,11 +459,10 @@ def test_slow_sign_delay():
             "slow_engaged": False,
             "slow_loss_streak": 0,
             "slow_pending_until": 0.0,
-            "stop_visible_streak": 0,
-            "stop_armed": False,
-            "stop_loss_streak": 0,
+            "stop_confirm_count": 0,
+            "stop_triggered_latch": False,
+            "stop_pending_rearm": False,
             "stop_rearm_until": 0.0,
-            "stop_tag_latch_resume": False,
         }
     )
     cfg = {
@@ -363,9 +471,6 @@ def test_slow_sign_delay():
         "sign_confirm_frames": 2,
         "sign_cooldown_s": 0.0,
         "sign_center_roi": 1.0,
-        "sign_stop_on_loss": True,
-        "sign_stop_seen_min_frames": 99,
-        "sign_stop_loss_confirm_frames": 2,
         "sign_slow_mode": "delay",
         "sign_slow_delay_s": 2.5,
     }
@@ -392,9 +497,6 @@ def test_tag_slow_distance_engages():
         "sign_confirm_frames": 2,
         "sign_cooldown_s": 2.0,
         "sign_center_roi": 1.0,
-        "sign_stop_on_loss": True,
-        "sign_stop_seen_min_frames": 99,
-        "sign_stop_loss_confirm_frames": 2,
         "sign_slow_mode": "distance",
         "sign_slow_distance_m": 0.40,
         "sign_slow_loss_confirm_frames": 2,
@@ -422,9 +524,6 @@ def test_tag_slow_candidate_not_stale_normal():
         "sign_confirm_frames": 1,
         "sign_cooldown_s": 2.0,
         "sign_center_roi": 1.0,
-        "sign_stop_on_loss": True,
-        "sign_stop_seen_min_frames": 99,
-        "sign_stop_loss_confirm_frames": 2,
         "sign_slow_mode": "distance",
         "sign_slow_distance_m": 0.40,
         "sign_slow_loss_confirm_frames": 99,
@@ -437,55 +536,42 @@ def test_tag_slow_candidate_not_stale_normal():
     print("OK: engaged slow keeps EVENT_SLOW_SIGN during cooldown")
 
 
-def test_stop_sign_on_loss():
-    agent._sign_runtime.update(
-        {
-            "candidate_event": agent.EVENT_NORMAL,
-            "candidate_count": 0,
-            "active_until": 0.0,
-            "stop_visible_streak": 0,
-            "stop_armed": False,
-            "stop_loss_streak": 0,
-            "stop_rearm_until": 0.0,
-            "stop_tag_latch_resume": False,
-        }
-    )
+def test_stop_sign_distance():
+    agent.reset_sign_detection_state()
     cfg = {
         "stop_tag_ids": [20],
         "slow_tag_ids": [39],
-        "sign_confirm_frames": 3,
+        "sign_confirm_frames": 2,
         "sign_cooldown_s": 0.0,
         "sign_center_roi": 1.0,
-        "sign_stop_on_loss": True,
-        "sign_stop_seen_min_frames": 3,
-        "sign_stop_loss_confirm_frames": 2,
+        "sign_stop_distance_m": 0.30,
         "sign_stop_rearm_s": 1.0,
     }
-    stop_det = agent._TagDetection(20, (320.0, 240.0))
+    far = agent._TagDetection(20, (320.0, 240.0), 0.55)
+    near = agent._TagDetection(20, (320.0, 240.0), 0.25)
     shape = (480, 640)
 
-    for _ in range(3):
-        ev = agent.detect_sign_event([stop_det], shape, cfg)
-        assert ev == agent.EVENT_NORMAL, "Stop tag visible should not stop yet"
+    assert agent.detect_sign_event([far], shape, cfg) == agent.EVENT_NORMAL
+    assert agent.detect_sign_event([near], shape, cfg) == agent.EVENT_NORMAL
 
-    ev = agent.detect_sign_event([], shape, cfg)
-    assert ev == agent.EVENT_NORMAL, "One loss frame should not stop yet"
+    ev = agent.detect_sign_event([near], shape, cfg)
+    assert ev == agent.EVENT_STOP_SIGN, "Stop should trigger when tag is within distance"
+    assert agent._sign_runtime.get("stop_triggered_latch") is True
+    assert agent._sign_runtime.get("stop_pending_rearm") is True
 
-    ev = agent.detect_sign_event([], shape, cfg)
-    assert ev == agent.EVENT_STOP_SIGN, "Stop should trigger after tag leaves view"
-    assert agent._sign_runtime.get("stop_tag_latch_resume") is True
-    print("OK: stop sign triggers on tag loss")
+    assert agent.detect_sign_event([near], shape, cfg) == agent.EVENT_NORMAL
+    print("OK: stop sign triggers on distance, not tag loss")
 
 
 def test_sign_state_cleared_on_pause():
     agent._sign_runtime["slow_engaged"] = True
     agent._sign_runtime["slow_confirm_count"] = 5
-    agent._sign_runtime["stop_armed"] = True
+    agent._sign_runtime["stop_triggered_latch"] = True
     agent.set_driving_enabled(True)
     agent.set_driving_enabled(False)
     assert agent._sign_runtime.get("slow_engaged") is False
     assert int(agent._sign_runtime.get("slow_confirm_count", 0)) == 0
-    assert agent._sign_runtime.get("stop_armed") is False
+    assert agent._sign_runtime.get("stop_triggered_latch") is False
     print("OK: sign detection state cleared on pause/stop")
 
 
@@ -494,49 +580,49 @@ def test_follower_cruise_target_speed_startup():
     from tasks.project.packages.follower_spacing import GridSpacingController
 
     cfg = {
-        "slow_speed": 0.15,
+        "slow_speed": 0.12,
         "span_target_px": 28.0,
         "spacing_kp": 0.012,
         "spacing_kd": 0.022,
         "follower_require_leader": True,
         "follower_spacing_warmup_frames": 8,
         "follower_catchup_margin": 0.06,
-        "follower_lane_fallback_speed": 0.15,
+        "follower_lane_fallback_speed": 0.12,
         "span_too_close_px": 44.0,
-        "span_too_close_speed": 0.06,
+        "span_too_close_speed": 0.05,
     }
     spacing = GridSpacingController()
 
     blind = _follower_cruise_target_speed(
-        spacing, cfg, 0.0, 0.48, 0.4, 0.15, False, 0, None,
+        spacing, cfg, 0.0, 0.368, 0.32, 0.12, False, 0, None,
     )
     assert blind == 0.0, "require_leader + no grid -> hold still"
 
     cfg_lane = dict(cfg)
     cfg_lane["follower_require_leader"] = False
-    cfg_lane["follower_lane_fallback_speed"] = 0.4
+    cfg_lane["follower_lane_fallback_speed"] = 0.32
     lane_only = _follower_cruise_target_speed(
-        spacing, cfg_lane, 0.0, 0.48, 0.4, 0.15, False, 0, None,
+        spacing, cfg_lane, 0.0, 0.368, 0.32, 0.12, False, 0, None,
     )
-    assert lane_only == 0.4, "lane fallback when leader lost"
+    assert lane_only == 0.32, "lane fallback when leader lost"
 
     spacing.observe(18.0, 0.0, cfg, 0.0)
     early = _follower_cruise_target_speed(
-        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 2, 18.0,
+        spacing, cfg, 0.0, 0.368, 0.32, 0.12, True, 2, 18.0,
     )
-    assert early <= 0.15, "warmup should not sprint before spacing settles"
+    assert early <= 0.12, "warmup should not sprint before spacing settles"
 
     for i in range(10):
-        spacing.observe(18.0, 0.2 + i * 0.1, cfg, 0.15)
+        spacing.observe(18.0, 0.2 + i * 0.1, cfg, 0.12)
     chase = _follower_cruise_target_speed(
-        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 10, 18.0,
+        spacing, cfg, 0.0, 0.368, 0.32, 0.12, True, 10, 18.0,
     )
-    assert chase <= 0.46 + 1e-6, "convoy should not outrun leader cruise by much"
+    assert chase <= 0.368 + 1e-6, "convoy should not outrun leader cruise by much"
 
     close = _follower_cruise_target_speed(
-        spacing, cfg, 0.0, 0.48, 0.4, 0.15, True, 10, 45.0,
+        spacing, cfg, 0.0, 0.368, 0.32, 0.12, True, 10, 45.0,
     )
-    assert close <= 0.06 + 1e-6, "too-close span should crawl or stop"
+    assert close <= 0.05 + 1e-6, "too-close span should crawl or stop"
     print("OK: follower cruise speed is conservative at startup")
 
 
@@ -559,10 +645,42 @@ def test_intersection_arc_pwm_not_scaled_by_cruise():
     }
     expected = intersection_wheel_commands("right", cfg)
     wheels = _Wheels()
-    _apply_lane_wheels(wheels, expected[0], expected[1], 0.48, True)
+    _apply_lane_wheels(wheels, expected[0], expected[1], 0.368, True)
     assert abs(wheels.left - expected[0]) < 1e-6
     assert abs(wheels.right - expected[1]) < 1e-6
     print("OK: intersection arc PWM is direct, not cruise-scaled")
+
+
+def test_intersection_turn_params_reload_and_live_schedule():
+    from tasks.project.packages.intersection_follow import intersection_phase_deadlines
+
+    before = agent.get_intersection_turn_params()
+    result = agent.patch_intersection_turn_params({"intersection_turn_left_s": 3.21})
+    assert result["status"] == "ok"
+    assert result.get("config_path")
+    cfg = agent.load_config()
+    assert abs(cfg["intersection_turn_left_s"] - 3.21) < 1e-6
+
+    t0 = 100.0
+    _, arc_end, _, schedule = intersection_phase_deadlines(t0, "left", cfg)
+    assert abs(schedule["arc_s"] - 3.21) < 1e-6
+    assert abs(arc_end - (t0 + schedule["preamble_s"] + 3.21)) < 1e-6
+
+    agent.patch_intersection_turn_params(
+        {"intersection_turn_left_s": before["intersection_turn_left_s"]},
+    )
+    print("OK: intersection turn UI params reload and live schedule")
+
+
+def test_follower_test_turn_queue():
+    from unittest.mock import patch
+
+    with patch.object(agent, "load_config", return_value={"role": "follower"}):
+        result = agent.request_follower_test_turn("left")
+    assert result["status"] == "ok" and result["direction"] == "left"
+    assert agent.get_follower_test_turn_status()["queued"] == "left"
+    assert agent._pop_follower_test_turn() == "left"
+    print("OK: follower test turn queues without Start")
 
 
 def test_loops_exit_cleanly():
@@ -582,13 +700,17 @@ if __name__ == "__main__":
     test_project_lane_masks_not_cut_on_straight()
     test_lane_ignore_red_for_convoy()
     test_leader_turn_tracker()
-    test_leader_blue_detection()
+    test_intersection_turn_uses_detector_not_grid_when_loaded()
+    test_leader_detector_tracking()
+    test_leader_detector_spacing_params()
     test_follower_cruise_target_speed_startup()
     test_intersection_arc_pwm_not_scaled_by_cruise()
+    test_intersection_turn_params_reload_and_live_schedule()
+    test_follower_test_turn_queue()
     test_slow_sign_delay()
     test_tag_slow_distance_engages()
     test_tag_slow_candidate_not_stale_normal()
-    test_stop_sign_on_loss()
+    test_stop_sign_distance()
     test_sign_state_cleared_on_pause()
     test_role_dispatch()
     test_loops_exit_cleanly()

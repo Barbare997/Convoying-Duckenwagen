@@ -4,14 +4,14 @@ extends PathFollow3D
 ## right after that accept) plus a short grace, so the follower departs with
 ## the leader's back marker in view instead of an empty road.
 
-@export var speed: float = 0.4
+@export var speed: float = 0.32
 @export var start_grace_s: float = 4.0
 # Corner profile, mirroring the real lead bot's stop-and-slow-after-turn
 # behaviour: the follower is blind while the leader turns (the back marker
 # leaves its camera), so slow into bends and dwell briefly after them to let
 # the follower round the corner and re-lock before the gap opens.
-@export var corner_speed: float = 0.33
-@export var corner_exit_speed: float = 0.23
+@export var corner_speed: float = 0.26
+@export var corner_exit_speed: float = 0.18
 @export var corner_exit_slow_s: float = 3.0
 @export var corner_bend_rad: float = 0.25
 

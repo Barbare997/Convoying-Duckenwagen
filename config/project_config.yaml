@@ -1,182 +1,108 @@
-role: follower
-
-
-
-# Sign input: both = UI buttons + AprilTags (buttons win when Slow/Stop latched)
-
-sign_source: both
-
-
-
-# Leader only: true = same wheel PWM as visual_lane_servoing task (uses lane_servoing_config.yaml).
-# Follower always scales lane PWM to spacing/commanded speed (keep false on follower bot).
-lane_use_direct_pwm: false
-# Straights: 0 = full yellow/white masks (same as visual_lane_servoing).
-# Bottom band is trimmed only when at_line (see lane_ignore_bottom_at_intersection_frac).
-lane_ignore_bottom_frac: 0.0
-lane_ignore_bottom_at_intersection_frac: 0.35
-
-cruise_speed: 0.40
-
-slow_speed: 0.20
-
-
-
-follower_max_speed: 0.46
+camera_calib_height: 480
+camera_calib_width: 640
+camera_cx: 324.0
+camera_cy: 239.3
+camera_fx: 337.8
+camera_fy: 337.3
+cruise_speed: 0.32
+decel_steps: 10
+decel_time_s: 1.5
+follower_catchup_margin: 0.18
+follower_lane_fallback_speed: 0.32
+follower_max_speed: 0.368
+follower_min_speed: 0.0
 follower_require_leader: false
 follower_spacing_warmup_frames: 8
-follower_catchup_margin: 0.06
-# Speed when leader grid is lost — lane follow at cruise (same as normal lane servoing).
-follower_lane_fallback_speed: 0.40
-
-follower_min_speed: 0.0
-
-# --- Grid spacing (span_px = mean dot spacing; grows as leader gets closer) ---
-# Park at desired gap on the bot, read span_px from logs, set span_target_px to that value.
-# Lower span_target_px = stay farther back (smaller dots in frame).
-span_target_px: 7.0
-spacing_kp: 0.012
-spacing_kd: 0.022
-spacing_span_dot_alpha: 0.35
-spacing_leader_alpha: 0.12
-spacing_leader_ff_gain: 0.012
-spacing_steady_span_px: 5.0
-spacing_steady_span_dot: 10.0
-span_too_close_px: 18.0
-span_too_close_speed: 0.06
-
-# Circle-grid detect rate for follower (Hz)
-
-grid_detect_hz: 10
-
-# Treat leader as lost after this many consecutive frames without a valid grid (lane follow continues)
-
-leader_loss_confirm_frames: 3
-
-# Red-line intersection: near band = bottom of frame (lower frac => trigger earlier)
-intersection_red_near_top_frac: 0.65
-intersection_red_far_top_frac: 0.35
-intersection_red_near_min_pixels: 2200
-intersection_red_near_min_frac: 0.038
-intersection_red_near_far_ratio: 1.6
-intersection_red_confirm_frames: 2
-intersection_red_approach_min_far_px: 600
-intersection_turn_track_window: 20
-intersection_turn_infer_lookback: 8
-# Last-seen grid: wide face-on aspect + weak heading => straight.
-intersection_straight_aspect_min: 2.2
-intersection_last_cx_offset_px: 28
-intersection_cx_drift_px: 30
-intersection_heading_thresh: 0.12
-# Flip raw grid heading onto turn direction: leader right yaw -> right column taller -> raw h<0 -> turn right.
-intersection_heading_sign: -1.0
-# Fixed intersection PWM (straight + arc); not throttled by spacing/blue fallback.
-intersection_turn_speed: 0.40
-intersection_turn_inner_ratio: 0.38
-intersection_turn_outer_ratio: 0.72
-# Left/right: blind straight into the intersection, then timed arc (lower = less yaw).
-intersection_left_preamble_s: 0.55
-intersection_right_preamble_s: 0.35
-intersection_turn_straight_s: 1.4
-intersection_turn_left_s: 1.90
-intersection_turn_right_s: 1.80
-intersection_turn_tail_straight_s: 0.0
-
-
-# Leader rear dot grid (7 columns x 3 rows, black dots on white)
-
-grid_cols: 7
-
-grid_rows: 3
-
-grid_blob_min_area: 20
-
 grid_blob_max_area: 12000
-
-# MarkerGridTracker (duckietown-convoy style — ROI + far-band + grace)
-grid_downscale: 0.5
-grid_roi_pad_px: 60
-grid_roi_downscale: 1.0
-grid_far_search: true
-grid_far_band_top_frac: 0.10
-grid_far_band_bot_frac: 0.45
-grid_lost_grace_frames: 6
-grid_use_clustering: false
+grid_blob_min_area: 20
 grid_blob_min_circularity: 0.6
-# Span px thresholds: map dot spacing to distance_signal (tune in sim UI overlay)
-# Wider stop-safe gap = signal rises slower as you approach the leader.
+grid_cols: 7
+grid_detect_hz: 10
+grid_downscale: 0.5
+grid_far_band_bot_frac: 0.45
+grid_far_band_top_frac: 0.1
+grid_far_search: true
+grid_lost_grace_frames: 6
+grid_roi_downscale: 1.0
+grid_roi_pad_px: 60
+grid_rows: 3
 grid_safe_px: 18
 grid_stop_px: 48
-
-# Blue duckie body fallback when rear dot grid is too small / lost (real bots).
-leader_blue_enabled: true
-# Saturated duckie blue only — raise s/v mins to drop dark gray walls at the horizon.
-leader_blue_h_min: 100
-leader_blue_h_max: 125
-leader_blue_s_min: 90
-leader_blue_v_min: 75
-leader_blue_roi_top_frac: 0.22
-leader_blue_roi_bottom_frac: 0.82
-leader_blue_min_area: 600
-leader_blue_max_area: 90000
-leader_blue_span_scale: 0.55
-# Desired blue span_px at follow gap (higher = follow closer). Grid uses span_target_px above.
-leader_blue_span_target_px: 38
-leader_blue_safe_px: 14
-leader_blue_stop_px: 50
+grid_use_clustering: false
 intersection_blue_straight_center_px: 18
-
-
-slow_hold_s: 4.0
-
-decel_time_s: 1.2
-
-decel_steps: 10
-
-speed_ramp_s: 1.0
-
-
-
-stop_tag_ids: [20,21,22,23,24,25,26,27,28,29]
-
-slow_tag_ids: [39]
-
-
-
-sign_slow_mode: distance
-
-sign_slow_distance_m: 0.40
-
-sign_slow_loss_confirm_frames: 2
-
-sign_tag_size_m: 0.065
-
-camera_fx: 337.8
-
-camera_fy: 337.3
-
-camera_cx: 324.0
-
-camera_cy: 239.3
-
-camera_calib_width: 640
-
-camera_calib_height: 480
-
-sign_confirm_frames: 3
-
-sign_cooldown_s: 2.0
-
+intersection_cx_drift_px: 30
+intersection_heading_sign: -1.0
+intersection_heading_thresh: 0.12
+intersection_last_cx_offset_px: 28
+intersection_left_preamble_s: 0.69
+intersection_red_approach_min_far_px: 600
+intersection_red_confirm_frames: 2
+intersection_red_far_top_frac: 0.35
+intersection_red_near_far_ratio: 1.6
+intersection_red_near_min_frac: 0.038
+intersection_red_near_min_pixels: 2200
+intersection_red_near_top_frac: 0.65
+intersection_right_preamble_s: 0.44
+intersection_straight_aspect_min: 2.2
+intersection_turn_infer_lookback: 8
+intersection_turn_inner_ratio: 0.2
+intersection_turn_left_s: 2.38
+intersection_turn_outer_ratio: 0.9
+intersection_turn_right_s: 2.0
+intersection_turn_speed: 0.4
+intersection_turn_straight_s: 1.75
+intersection_turn_tail_straight_s: 0.0
+intersection_turn_track_window: 20
+lane_ignore_bottom_at_intersection_frac: 0.35
+lane_ignore_bottom_frac: 0.0
+lane_use_direct_pwm: false
+leader_detector_class: 1
+leader_detector_enabled: true
+leader_detector_hz: 8
+leader_detector_min_area: 500
+leader_detector_roi_bottom_frac: 0.82
+leader_detector_roi_top_frac: 0.0
+leader_detector_safe_px: 28
+leader_detector_span_scale: 0.55
+leader_detector_span_target_px: 140
+leader_detector_stop_px: 100
+leader_grid_fallback_enabled: true
+leader_loss_confirm_frames: 3
+role: follower
 sign_center_roi: 1.0
-
+sign_confirm_frames: 3
+sign_cooldown_s: 2.0
 sign_slow_delay_s: 2.5
-
-sign_stop_on_loss: true
-
-sign_stop_seen_min_frames: 8
-
-sign_stop_loss_confirm_frames: 2
-
+sign_slow_distance_m: 0.4
+sign_slow_loss_confirm_frames: 2
+sign_slow_mode: distance
+sign_source: both
+sign_stop_distance_m: 0.25
 sign_stop_rearm_s: 6.0
-
-
+sign_tag_size_m: 0.065
+slow_hold_s: 4.0
+slow_speed: 0.16
+slow_tag_ids:
+- 39
+spacing_kd: 0.022
+spacing_kp: 0.02
+spacing_leader_alpha: 0.12
+spacing_leader_ff_gain: 0.012
+spacing_span_dot_alpha: 0.35
+spacing_steady_span_dot: 10.0
+spacing_steady_span_px: 5.0
+span_target_px: 26.0
+span_too_close_px: 68.0
+span_too_close_speed: 0.05
+speed_ramp_s: 1.25
+stop_tag_ids:
+- 20
+- 21
+- 22
+- 23
+- 24
+- 25
+- 26
+- 27
+- 28
+- 29
